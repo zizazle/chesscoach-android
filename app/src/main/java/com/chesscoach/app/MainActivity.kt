@@ -36,8 +36,6 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
-import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
@@ -46,7 +44,6 @@ import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileOutputStream
-import kotlin.math.roundToInt
 
 class MainActivity : AppCompatActivity() {
 
@@ -56,7 +53,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var storageFile: File
     private lateinit var userScriptsDir: File
 
-    // Системный проводник Android для <input type="file"> (обои, .chess конфиги, .js скрипты)
     private val fileChooserLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -86,7 +82,6 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Полноэкранный игровой режим + не гасить экран во время партии
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.statusBarColor = Color.parseColor("#06080E")
         window.navigationBarColor = Color.parseColor("#06080E")
@@ -124,7 +119,6 @@ class MainActivity : AppCompatActivity() {
         setupWebView()
         setupBackNavigation()
 
-        // При старте загружаем последнюю выбранную платформу (по умолчанию Lichess, с открытым Лаунчером)
         val initialUrl = getLastPlatformUrl()
         webView.loadUrl(initialUrl)
     }
@@ -147,18 +141,17 @@ class MainActivity : AppCompatActivity() {
         settings.javaScriptEnabled = true
         settings.domStorageEnabled = true
         settings.databaseEnabled = true
-        settings.mediaPlaybackRequiresUserGesture = false // Для WebAudio пингов и Phonk-эдитов
+        settings.mediaPlaybackRequiresUserGesture = false
         settings.allowFileAccess = true
         settings.allowContentAccess = true
-        settings.loadWithOverviewMode = true
-        settings.useWideViewPort = true
+        settings.loadWithOverviewMode = false
+        settings.useWideViewPort = false
         settings.setSupportZoom(false)
         settings.builtInZoomControls = false
         settings.displayZoomControls = false
         settings.cacheMode = WebSettings.LOAD_DEFAULT
         settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
 
-        // Современный мобильный User-Agent Chrome для стабильного входа в аккаунты
         val defaultUa = settings.userAgentString
         settings.userAgentString = defaultUa
             .replace("; wv", "")
@@ -176,7 +169,6 @@ class MainActivity : AppCompatActivity() {
             .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(this))
             .build()
 
-        // Инжект на старте документа (ДО загрузки скриптов сайта)
         if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
             val startScript = buildDocumentStartScript()
             WebViewCompat.addDocumentStartJavaScript(
@@ -193,8 +185,6 @@ class MainActivity : AppCompatActivity() {
                 request: WebResourceRequest
             ): WebResourceResponse? {
                 val url = request.url
-
-                // Перехват виртуальных ассетов расширения с добавлением CORS-заголовков
                 if (url.host == "appassets.androidplatform.net") {
                     val path = url.path ?: ""
                     if (path.startsWith("/assets/user_scripts/")) {
@@ -222,7 +212,6 @@ class MainActivity : AppCompatActivity() {
 
             override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
-                // Фолбэк, если устройство не поддерживает DOCUMENT_START_SCRIPT
                 if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
                     view.evaluateJavascript(buildDocumentStartScript(), null)
                 }
@@ -261,14 +250,7 @@ class MainActivity : AppCompatActivity() {
             "Access-Control-Allow-Methods" to "GET, OPTIONS",
             "Cache-Control" to "no-store"
         )
-        return WebResourceResponse(
-            mime,
-            "UTF-8",
-            200,
-            "OK",
-            headers,
-            ByteArrayInputStream(bytes)
-        )
+        return WebResourceResponse(mime, "UTF-8", 200, "OK", headers, ByteArrayInputStream(bytes))
     }
 
     private fun readAssetTextSafe(relPath: String): String {
@@ -279,12 +261,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Скрипт, выполняющийся в момент создания окна (DOCUMENT_START):
-     * 1. Инициализирует cc-android-polyfill.js (chrome.storage, chrome.runtime, background.js).
-     * 2. На Lichess.org инжектит main-bridge.js для мгновенного перехвата WebSocket.
-     *    На Chess.com main-bridge.js НЕ инжектится для 100% обхода проверки прототипов Fair Play.
-     */
     private fun buildDocumentStartScript(): String {
         val mainBridgeCode = readAssetTextSafe("content/main-bridge.js")
         return """
@@ -302,7 +278,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Полный инжект всех модулей расширения при готовности страницы
+     * ВАЖНО: Сначала инжектится polyfillJs + mobileLauncherOrbJs (чтобы перехватить attachShadow
+     * и вшить content.css напрямую), и только потом запускается content.js / chesscom.js!
      */
     private fun injectMainChessCoachBundle(url: String) {
         val host = Uri.parse(url).host?.lowercase() ?: ""
@@ -315,6 +292,7 @@ class MainActivity : AppCompatActivity() {
         val openingsJs = readAssetTextSafe("lib/openings.js")
         val explainerJs = readAssetTextSafe("lib/explainer.js")
         val phonkFxJs = readAssetTextSafe("lib/phonk-fx.js")
+        val mobileLauncherOrbJs = readAssetTextSafe("bridge/cc-mobile-launcher-orb.js")
         val scriptApiJs = readAssetTextSafe("lib/script-api.js")
         val platformCoreJs = if (isChessCom) {
             readAssetTextSafe("content/chesscom.js")
@@ -322,9 +300,8 @@ class MainActivity : AppCompatActivity() {
             readAssetTextSafe("content/content.js")
         }
         val sampleScriptJs = readAssetTextSafe("scripts/sample.js")
-        val mobileLauncherOrbJs = readAssetTextSafe("bridge/cc-mobile-launcher-orb.js")
 
-        val fullBundle = StringBuilder(512_000)
+        val fullBundle = StringBuilder(550_000)
         fullBundle.append("(function(){\n")
         fullBundle.append("if (window.__ccAndroidBundleInjected) return;\n")
         fullBundle.append("window.__ccAndroidBundleInjected = true;\n")
@@ -333,10 +310,10 @@ class MainActivity : AppCompatActivity() {
         fullBundle.append("try {\n").append(openingsJs).append("\n} catch(e){ console.error('Openings err', e); }\n")
         fullBundle.append("try {\n").append(explainerJs).append("\n} catch(e){ console.error('Explainer err', e); }\n")
         fullBundle.append("try {\n").append(phonkFxJs).append("\n} catch(e){ console.error('PhonkFX err', e); }\n")
+        fullBundle.append("try {\n").append(mobileLauncherOrbJs).append("\n} catch(e){ console.error('Launcher err', e); }\n")
         fullBundle.append("try {\n").append(scriptApiJs).append("\n} catch(e){ console.error('ScriptAPI err', e); }\n")
         fullBundle.append("try {\n").append(platformCoreJs).append("\n} catch(e){ console.error('Core err', e); }\n")
         fullBundle.append("try {\n").append(sampleScriptJs).append("\n} catch(e){ console.error('Sample err', e); }\n")
-        fullBundle.append("try {\n").append(mobileLauncherOrbJs).append("\n} catch(e){ console.error('Launcher err', e); }\n")
         fullBundle.append("})();")
 
         webView.evaluateJavascript(fullBundle.toString(), null)
@@ -359,9 +336,6 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
-    /**
-     * Мост между JavaScript (cc-android-polyfill.js / cc-mobile-launcher-orb.js) и нативным Android
-     */
     inner class AndroidBridge {
 
         @JavascriptInterface
@@ -499,11 +473,6 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {}
         }
 
-        /**
-         * ГЕНЕРАТОР НАТИВНОГО ФИЗИЧЕСКОГО ТАПА ANDROID (isTrusted: true)
-         * Переводит CSS-координаты клетки в реальные экранные пиксели и отправляет
-         * аппаратный MotionEvent прямо в WebView.
-         */
         @JavascriptInterface
         fun dispatchNativeTap(cssX: Float, cssY: Float, holdMs: Long) {
             mainHandler.post {
@@ -512,85 +481,17 @@ class MainActivity : AppCompatActivity() {
                 val rawY = cssY * density
                 val downTime = SystemClock.uptimeMillis()
 
-                val downEvent = MotionEvent.obtain(
-                    downTime,
-                    downTime,
-                    MotionEvent.ACTION_DOWN,
-                    rawX,
-                    rawY,
-                    0
-                )
+                val downEvent = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, rawX, rawY, 0)
                 webView.dispatchTouchEvent(downEvent)
                 downEvent.recycle()
 
                 val safeHold = holdMs.coerceIn(35L, 220L)
                 mainHandler.postDelayed({
                     val upTime = SystemClock.uptimeMillis()
-                    val upEvent = MotionEvent.obtain(
-                        downTime,
-                        upTime,
-                        MotionEvent.ACTION_UP,
-                        rawX + 0.5f,
-                        rawY + 0.5f,
-                        0
-                    )
+                    val upEvent = MotionEvent.obtain(downTime, upTime, MotionEvent.ACTION_UP, rawX + 0.5f, rawY + 0.5f, 0)
                     webView.dispatchTouchEvent(upEvent)
                     upEvent.recycle()
                 }, safeHold)
-            }
-        }
-
-        /**
-         * ГЕНЕРАТОР НАТИВНОГО СВАЙПА ПО ДУГЕ БЕЗЬЕ (isTrusted: true для Drag & Drop и Премувов)
-         */
-        @JavascriptInterface
-        fun dispatchNativeBezierSwipe(
-            cssX1: Float,
-            cssY1: Float,
-            cssX2: Float,
-            cssY2: Float,
-            durationMs: Long
-        ) {
-            mainHandler.post {
-                val density = resources.displayMetrics.density
-                val x1 = cssX1 * density
-                val y1 = cssY1 * density
-                val x2 = cssX2 * density
-                val y2 = cssY2 * density
-
-                val midX = (x1 + x2) / 2f + ((Math.random() - 0.5) * 32f * density).toFloat()
-                val midY = (y1 + y2) / 2f + ((Math.random() - 0.5) * 32f * density).toFloat()
-
-                val downTime = SystemClock.uptimeMillis()
-                val downEv = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, x1, y1, 0)
-                webView.dispatchTouchEvent(downEv)
-                downEv.recycle()
-
-                val steps = 8
-                val totalDur = durationMs.coerceIn(70L, 450L)
-                val stepDelay = totalDur / steps
-
-                for (i in 1..steps) {
-                    mainHandler.postDelayed({
-                        val t = i.toFloat() / steps.toFloat()
-                        val inv = 1f - t
-                        val bx = inv * inv * x1 + 2f * inv * t * midX + t * t * x2
-                        val by = inv * inv * y1 + 2f * inv * t * midY + t * t * y2
-                        val moveTime = SystemClock.uptimeMillis()
-                        val moveEv = MotionEvent.obtain(downTime, moveTime, MotionEvent.ACTION_MOVE, bx, by, 0)
-                        webView.dispatchTouchEvent(moveEv)
-                        moveEv.recycle()
-
-                        if (i == steps) {
-                            mainHandler.postDelayed({
-                                val upTime = SystemClock.uptimeMillis()
-                                val upEv = MotionEvent.obtain(downTime, upTime, MotionEvent.ACTION_UP, x2, y2, 0)
-                                webView.dispatchTouchEvent(upEv)
-                                upEv.recycle()
-                            }, 18L)
-                        }
-                    }, i * stepDelay)
-                }
             }
         }
     }
