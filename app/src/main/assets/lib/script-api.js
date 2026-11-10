@@ -6,11 +6,15 @@
   const dynamicallyLoadedFiles = new Set();
   let hudShadow = null;
 
-  // Перехватываем ТОЛЬКО закрытый ShadowRoot главного меню ChessCoach
+  // Перехватываем закрытый ShadowRoot главного меню ChessCoach
   const origAttachShadow = Element.prototype.attachShadow;
   Element.prototype.attachShadow = function (init) {
     const sr = origAttachShadow.call(this, init);
-    if (this.id !== "cc-userscripts-host" && (!hudShadow || (init && init.mode === "closed"))) {
+    if (
+      this.id !== "cc-userscripts-host" &&
+      this.id !== "cc-floating-orb-host" &&
+      (!hudShadow || (init && init.mode === "closed"))
+    ) {
       hudShadow = sr;
     }
     return sr;
@@ -45,123 +49,103 @@
   let scriptsHost = null;
   let scriptsShadow = null;
 
+  const DOCKED_SCRIPT_STYLES = `
+    .cc-docked-script-win {
+      margin-top: 10px;
+      background: rgba(8, 11, 19, 0.92);
+      border: 1px solid rgba(0, 245, 212, 0.35);
+      border-radius: 14px;
+      overflow: hidden;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 8px 24px rgba(0, 0, 0, 0.45);
+    }
+    .cc-script-win-bar {
+      height: 3px;
+      width: 100%;
+      background: linear-gradient(90deg, #00f5d4, #00bbf9, #c77dff, #ff2a85);
+    }
+    .cc-script-win-header {
+      padding: 9px 12px;
+      background: rgba(5, 7, 13, 0.9);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 11px;
+      font-weight: 900;
+      color: #00f5d4;
+      letter-spacing: 0.4px;
+    }
+    .cc-script-win-body {
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+    }
+    .cc-ctrl-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      padding: 9px 11px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.10);
+      border-radius: 11px;
+      font-size: 11.5px;
+      font-weight: 700;
+      color: #f1f5f9;
+    }
+    .cc-ctrl-col {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 9px 11px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.10);
+      border-radius: 11px;
+      font-size: 11px;
+      color: #f1f5f9;
+    }
+    .cc-tabs-bar {
+      display: grid;
+      gap: 6px;
+      background: rgba(5, 7, 13, 0.8);
+      padding: 5px;
+      border-radius: 10px;
+      border: 1px solid rgba(255, 255, 255, 0.09);
+    }
+    .cc-tab-trigger {
+      background: transparent;
+      border: 1px solid transparent;
+      color: #94a3b8;
+      border-radius: 8px;
+      padding: 6px 8px;
+      font-size: 11px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    .cc-tab-trigger.active {
+      background: rgba(0, 245, 212, 0.18);
+      color: #fff;
+      border-color: #00f5d4;
+    }
+  `;
+
+  // Контейнер для 60 FPS Canvas на доске и всплывающих OSD-баннеров
   function getScriptsShadow() {
     if (scriptsShadow) return scriptsShadow;
     scriptsHost = document.createElement("div");
     scriptsHost.id = "cc-userscripts-host";
     scriptsHost.style.cssText =
-      "all:initial; position:fixed; top:0; left:0; width:0; height:0; z-index:2147483647; pointer-events:none;";
+      "all:initial; position:fixed; top:0; left:0; width:0; height:0; z-index:2147483644; pointer-events:none;";
     document.documentElement.appendChild(scriptsHost);
     scriptsShadow = origAttachShadow.call(scriptsHost, { mode: "open" });
 
     const baseStyle = document.createElement("style");
-    baseStyle.textContent = `
-      * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "Segoe UI", Roboto, sans-serif; }
-      .cc-script-win {
-        position: fixed;
-        background: rgba(10, 13, 22, 0.94);
-        backdrop-filter: blur(24px) saturate(190%);
-        -webkit-backdrop-filter: blur(24px) saturate(190%);
-        border: 1px solid rgba(0, 245, 212, 0.38);
-        border-radius: 16px;
-        box-shadow: 0 24px 60px rgba(0,0,0,0.85), 0 0 28px rgba(0,245,212,0.18);
-        color: #f8fafc;
-        pointer-events: auto;
-        user-select: none;
-        overflow: hidden;
-        z-index: 2147483647;
-        transition: border-color 0.2s ease;
-      }
-      .cc-script-win-bar {
-        height: 3px;
-        width: 100%;
-        background: linear-gradient(90deg, #00f5d4, #00bbf9, #c77dff, #ff2a85);
-      }
-      .cc-script-win-header {
-        padding: 10px 14px;
-        background: rgba(6, 8, 14, 0.88);
-        border-bottom: 1px solid rgba(255,255,255,0.09);
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        cursor: grab;
-        font-size: 11.5px;
-        font-weight: 900;
-        letter-spacing: 0.4px;
-      }
-      .cc-script-win-header:active { cursor: grabbing; }
-      .cc-script-win-body {
-        padding: 12px 14px;
-        display: flex;
-        flex-direction: column;
-        gap: 8px;
-        max-height: 78vh;
-        overflow-y: auto;
-      }
-      .cc-ctrl-row {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        gap: 10px;
-        padding: 7px 10px;
-        background: rgba(255,255,255,0.05);
-        border: 1px solid rgba(255,255,255,0.10);
-        border-radius: 10px;
-        font-size: 11.5px;
-        font-weight: 700;
-      }
-      .cc-ctrl-col {
-        display: flex;
-        flex-direction: column;
-        gap: 5px;
-        padding: 8px 10px;
-        background: rgba(255,255,255,0.05);
-        border: 1px solid rgba(255,255,255,0.10);
-        border-radius: 10px;
-        font-size: 11px;
-      }
-      .cc-btn {
-        background: linear-gradient(135deg, #00f5d4, #00bbf9);
-        color: #05070c;
-        border: none;
-        border-radius: 9px;
-        padding: 8px 12px;
-        font-size: 11.5px;
-        font-weight: 900;
-        cursor: pointer;
-        text-align: center;
-        transition: transform 0.15s ease, opacity 0.15s ease;
-      }
-      .cc-btn:hover { transform: translateY(-1px); opacity: 0.95; }
-      .cc-tabs-bar {
-        display: grid;
-        gap: 5px;
-        background: rgba(5, 7, 13, 0.75);
-        padding: 5px;
-        border-radius: 10px;
-        border: 1px solid rgba(255,255,255,0.09);
-      }
-      .cc-tab-trigger {
-        background: transparent;
-        border: 1px solid transparent;
-        color: #94a3b8;
-        border-radius: 7px;
-        padding: 5px 6px;
-        font-size: 10.5px;
-        font-weight: 800;
-        cursor: pointer;
-      }
-      .cc-tab-trigger.active {
-        background: rgba(0, 245, 212, 0.18);
-        color: #fff;
-        border-color: #00f5d4;
-      }
-    `;
+    baseStyle.textContent = DOCKED_SCRIPT_STYLES;
     scriptsShadow.appendChild(baseStyle);
     return scriptsShadow;
   }
 
-  // ДИНАМИЧЕСКИЙ ЗАГРУЗЧИК СКРИПТОВ ИЗ ПАПКИ scripts/ БЕЗ ПРАВКИ MANIFEST.JSON
   async function loadScriptFileFromFolder(fileName, saveToList = true) {
     const cleanName = String(fileName || "").trim().replace(/^.*[\\/]/, "");
     if (!cleanName || !cleanName.endsWith(".js") || cleanName === "sample.js") return false;
@@ -183,7 +167,6 @@
       }
       return true;
     } catch (err) {
-      console.warn("[ChessCoach SDK] Не удалось загрузить scripts/" + cleanName + ". Убедитесь, что файл лежит в папке scripts/ и вы нажали Обновить в chrome://extensions/.", err);
       return false;
     }
   }
@@ -513,7 +496,7 @@
         inp.type = "color";
         inp.value = opts.value || "#00f5d4";
         inp.style.cssText =
-          "width:34px; height:24px; border:1px solid rgba(255,255,255,0.25); border-radius:6px; background:transparent; cursor:pointer; padding:0;";
+          "width:36px; height:26px; border:1px solid rgba(255,255,255,0.25); border-radius:6px; background:transparent; cursor:pointer; padding:0;";
 
         inp.addEventListener("input", () => {
           if (typeof opts.onChange === "function") opts.onChange(inp.value);
@@ -537,9 +520,9 @@
         span.textContent = opts.label || "Файл / Текстура";
 
         const btn = document.createElement("button");
-        btn.className = "cc-btn";
-        btn.style.padding = "5px 10px";
-        btn.style.fontSize = "10.5px";
+        btn.className = "cc-btn cc-btn-primary";
+        btn.style.padding = "6px 12px";
+        btn.style.fontSize = "11px";
         btn.textContent = "📂 Выбрать...";
 
         const fileInp = document.createElement("input");
@@ -572,41 +555,25 @@
           : { label: labelOrOpts, defaultKey, onTrigger };
 
         let currentKey = opts.defaultKey || opts.key || "KeyX";
-        let listening = false;
 
         const row = document.createElement("div");
         row.className = "cc-ctrl-row";
 
         const span = document.createElement("span");
-        span.textContent = opts.label || "Горячая клавиша";
+        span.textContent = opts.label || "Быстрое действие";
 
-        const bindBtn = document.createElement("button");
-        bindBtn.style.cssText =
-          "background:rgba(0,245,212,0.14); border:1px solid #00f5d4; color:#00f5d4; border-radius:7px; padding:4px 9px; font-family:monospace; font-size:11px; font-weight:900; cursor:pointer;";
-        bindBtn.textContent = "[" + currentKey.replace(/^Key/, "") + "]";
+        const triggerBtn = document.createElement("button");
+        triggerBtn.style.cssText =
+          "background:rgba(0,245,212,0.16); border:1px solid #00f5d4; color:#00f5d4; border-radius:8px; padding:5px 11px; font-size:11px; font-weight:900; cursor:pointer;";
+        triggerBtn.textContent = "⚡ ВЫПОЛНИТЬ";
 
-        bindBtn.addEventListener("click", () => {
-          listening = true;
-          bindBtn.textContent = "[Нажми клавишу...]";
-          bindBtn.style.borderColor = "#ffbe0b";
-          bindBtn.style.color = "#ffbe0b";
+        triggerBtn.addEventListener("click", (e) => {
+          if (typeof opts.onTrigger === "function") opts.onTrigger(e);
         });
 
         const keyHandler = (e) => {
           const tag = (e.target && e.target.tagName) ? e.target.tagName.toUpperCase() : "";
           if (tag === "INPUT" || tag === "TEXTAREA") return;
-
-          if (listening) {
-            e.preventDefault();
-            listening = false;
-            currentKey = e.code || e.key;
-            bindBtn.textContent = "[" + currentKey.replace(/^Key/, "") + "]";
-            bindBtn.style.borderColor = "#00f5d4";
-            bindBtn.style.color = "#00f5d4";
-            if (typeof opts.onChange === "function") opts.onChange(currentKey);
-            return;
-          }
-
           if (e.code === currentKey || e.key === currentKey || ("Key" + (e.key || "").toUpperCase()) === currentKey) {
             if (typeof opts.onTrigger === "function") opts.onTrigger(e);
           }
@@ -618,9 +585,9 @@
         }
 
         row.appendChild(span);
-        row.appendChild(bindBtn);
+        row.appendChild(triggerBtn);
         bodyEl.appendChild(row);
-        return bindBtn;
+        return triggerBtn;
       },
 
       addSelect(labelOrOpts, optionsArr, defaultVal, onChange) {
@@ -636,8 +603,7 @@
         lbl.textContent = opts.label || "Выбор";
 
         const sel = document.createElement("select");
-        sel.style.cssText =
-          "width:100%; background:rgba(10,13,20,0.95); color:#fff; border:1px solid rgba(255,255,255,0.2); border-radius:8px; padding:6px 8px; font-size:11px; font-weight:700; outline:none;";
+        sel.className = "cc-select";
 
         (opts.options || []).forEach((item) => {
           const op = document.createElement("option");
@@ -679,7 +645,7 @@
         inp.placeholder = opts.placeholder || "";
         inp.value = opts.value || "";
         inp.style.cssText =
-          "width:100%; background:rgba(10,13,20,0.95); color:#fff; border:1px solid rgba(255,255,255,0.2); border-radius:8px; padding:6px 8px; font-size:11px; font-weight:700; outline:none;";
+          "width:100%; background:rgba(10,13,20,0.95); color:#fff; border:1px solid rgba(255,255,255,0.2); border-radius:8px; padding:7px 9px; font-size:11.5px; font-weight:700; outline:none;";
 
         inp.addEventListener("input", () => {
           if (typeof opts.onChange === "function") opts.onChange(inp.value);
@@ -697,7 +663,7 @@
           : { label: labelOrOpts, onClick };
 
         const btn = document.createElement("button");
-        btn.className = "cc-btn";
+        btn.className = "cc-btn cc-btn-primary";
         btn.textContent = opts.label || "Кнопка";
         btn.addEventListener("click", () => {
           if (typeof opts.onClick === "function") opts.onClick();
@@ -709,7 +675,7 @@
       addInfo(textOrOpts) {
         const text = typeof textOrOpts === "object" ? textOrOpts.text : textOrOpts;
         const info = document.createElement("div");
-        info.style.cssText = "font-size:10.5px; color:#94a3b8; line-height:1.36; padding:2px 4px;";
+        info.style.cssText = "font-size:11px; color:#94a3b8; line-height:1.4; padding:2px 4px;";
         info.textContent = text || "";
         bodyEl.appendChild(info);
         return info;
@@ -732,6 +698,7 @@
 
         tabNames.forEach((name, idx) => {
           const btn = document.createElement("button");
+          btn.type = "button";
           btn.className = "cc-tab-trigger" + (idx === 0 ? " active" : "");
           btn.textContent = name;
 
@@ -764,23 +731,40 @@
     return helpers;
   }
 
+  /**
+   * Вместо отдельного плавающего окна поверх доски, встраивает настройки скрипта
+   * прямо внутрь карточки скрипта во вкладке «📜 СКРИПТЫ» главного меню!
+   */
+  function mountDockedWindowIntoHud(winEl, scriptEntry) {
+    if (!hudShadow) return false;
+    injectScriptsTabIntoHud();
+    if (scriptEntry) {
+      const cardSlot = hudShadow.getElementById("cc-script-dock-slot-" + scriptEntry.id);
+      if (cardSlot) {
+        cardSlot.innerHTML = "";
+        cardSlot.appendChild(winEl);
+        cardSlot.style.display = "block";
+        return true;
+      }
+    }
+    const listContainer = hudShadow.getElementById("cc-scripts-list-container");
+    if (listContainer) {
+      listContainer.appendChild(winEl);
+      return true;
+    }
+    return false;
+  }
+
   function createWindowForScript(scriptEntry, opts = {}) {
-    const root = getScriptsShadow();
     const id = opts.id || "cc-win-" + (scriptEntry ? scriptEntry.id : Math.random().toString(36).slice(2, 7));
-    const existing = root.getElementById(id);
-    if (existing) existing.remove();
+    if (hudShadow) {
+      const existing = hudShadow.getElementById(id);
+      if (existing) existing.remove();
+    }
 
     const win = document.createElement("div");
     win.id = id;
-    win.className = "cc-script-win";
-
-    const width = opts.width || 340;
-    const left = opts.left !== undefined ? opts.left : (opts.x !== undefined ? opts.x : 28);
-    const top = opts.top !== undefined ? opts.top : (opts.y !== undefined ? opts.y : 90);
-
-    win.style.width = width + "px";
-    win.style.left = left + "px";
-    win.style.top = top + "px";
+    win.className = "cc-docked-script-win";
 
     const topBar = document.createElement("div");
     topBar.className = "cc-script-win-bar";
@@ -788,64 +772,38 @@
     const header = document.createElement("div");
     header.className = "cc-script-win-header";
     header.innerHTML =
-      '<div style="display:flex; align-items:center; gap:7px;"><span style="width:8px; height:8px; border-radius:50%; background:#00f5d4; box-shadow:0 0 10px #00f5d4;"></span><span>' +
-      (opts.title || "📜 МЕНЮ СКРИПТА") +
+      '<div style="display:flex; align-items:center; gap:7px;"><span style="width:7px; height:7px; border-radius:50%; background:#00f5d4; box-shadow:0 0 8px #00f5d4;"></span><span>' +
+      (opts.title || "⚙️ НАСТРОЙКИ СКРИПТА") +
       "</span></div>";
 
-    const minBtn = document.createElement("button");
-    minBtn.textContent = "—";
-    minBtn.style.cssText =
-      "background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.16); color:#e2e8f0; border-radius:6px; padding:2px 8px; font-size:10px; font-weight:800; cursor:pointer;";
+    const foldBtn = document.createElement("button");
+    foldBtn.type = "button";
+    foldBtn.textContent = "Свернуть ▲";
+    foldBtn.style.cssText =
+      "background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.16); color:#e2e8f0; border-radius:6px; padding:3px 8px; font-size:10px; font-weight:800; cursor:pointer;";
 
     const body = document.createElement("div");
     body.className = "cc-script-win-body";
 
-    let minimized = false;
-    minBtn.addEventListener("click", () => {
-      minimized = !minimized;
-      body.style.display = minimized ? "none" : "flex";
-      minBtn.textContent = minimized ? "▢" : "—";
+    let folded = false;
+    foldBtn.addEventListener("click", () => {
+      folded = !folded;
+      body.style.display = folded ? "none" : "flex";
+      foldBtn.textContent = folded ? "Развернуть ▼" : "Свернуть ▲";
     });
 
-    header.appendChild(minBtn);
+    header.appendChild(foldBtn);
     win.appendChild(topBar);
     win.appendChild(header);
     win.appendChild(body);
-    root.appendChild(win);
 
-    let dragging = false, ox = 0, oy = 0;
-    const posKey = "cc_win_pos_" + id;
-    header.addEventListener("mousedown", (e) => {
-      if (e.target.tagName === "BUTTON") return;
-      dragging = true;
-      ox = e.clientX - win.offsetLeft;
-      oy = e.clientY - win.offsetTop;
-    });
-
-    const onMove = (e) => {
-      if (!dragging) return;
-      win.style.left = Math.max(0, Math.min(window.innerWidth - 120, e.clientX - ox)) + "px";
-      win.style.top = Math.max(0, Math.min(window.innerHeight - 50, e.clientY - oy)) + "px";
-    };
-    const onUp = () => {
-      if (dragging) {
-        dragging = false;
-        try {
-          chrome.storage?.local?.set({ [posKey]: { left: win.offsetLeft, top: win.offsetTop } });
-        } catch (e) {}
-      }
-    };
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-
-    try {
-      chrome.storage?.local?.get([posKey], (res) => {
-        if (res && res[posKey]) {
-          win.style.left = res[posKey].left + "px";
-          win.style.top = res[posKey].top + "px";
+    if (!mountDockedWindowIntoHud(win, scriptEntry)) {
+      const waitTimer = setInterval(() => {
+        if (mountDockedWindowIntoHud(win, scriptEntry)) {
+          clearInterval(waitTimer);
         }
-      });
-    } catch (e) {}
+      }, 150);
+    }
 
     const uiHelpers = attachUiHelpersToContainer(body, scriptEntry);
     const winObj = {
@@ -853,9 +811,11 @@
       body,
       ...uiHelpers,
       destroy() {
-        window.removeEventListener("mousemove", onMove);
-        window.removeEventListener("mouseup", onUp);
         win.remove();
+        if (hudShadow && scriptEntry) {
+          const slot = hudShadow.getElementById("cc-script-dock-slot-" + scriptEntry.id);
+          if (slot) slot.style.display = "none";
+        }
       }
     };
 
@@ -905,24 +865,24 @@
       "background: rgba(8, 11, 19, 0.95)",
       "border: 2px solid " + color,
       "border-radius: 14px",
-      "padding: 12px 26px",
+      "padding: 10px 20px",
       "color: #ffffff",
       "box-shadow: 0 16px 40px rgba(0,0,0,0.85), 0 0 30px " + color + "55",
       "text-align: center",
       "pointer-events: none",
-      "z-index: 2147483647"
+      "z-index: 2147483645"
     ].join(";");
 
     banner.innerHTML =
-      '<div style="font-size:18px; font-weight:900; letter-spacing:0.8px; color:' +
+      '<div style="font-size:15px; font-weight:900; letter-spacing:0.6px; color:' +
       color +
-      "; text-shadow:0 0 14px " +
+      "; text-shadow:0 0 12px " +
       color +
       '88;">' +
       text +
       "</div>" +
       (subtext
-        ? '<div style="font-size:11px; color:#cbd5e1; margin-top:4px; font-weight:600;">' + subtext + "</div>"
+        ? '<div style="font-size:10.5px; color:#cbd5e1; margin-top:3px; font-weight:600;">' + subtext + "</div>"
         : "");
 
     root.appendChild(banner);
@@ -1279,19 +1239,32 @@
       (scriptObj.enabled ? "АКТИВЕН" : "ВЫКЛ") +
       "</span>" +
       "</div>" +
-      "<div style='font-size:10.5px; color:#cbd5e1; margin-bottom:6px; line-height:1.35;'>" +
-      (scriptObj.description || "Пользовательский скрипт из папки scripts/") +
+      "<div style='font-size:11px; color:#cbd5e1; margin-bottom:8px; line-height:1.4;'>" +
+      (scriptObj.description || "Пользовательский скрипт с встроенными настройками прямо в этой вкладке.") +
       "</div>" +
-      '<div class="cc-Switch-row" style="padding:2px 0 0 0; border:none;">' +
-      "<span style='font-weight:800; color:#fff;'>⚡ Активировать и открыть окно скрипта</span>" +
+      '<div class="cc-Switch-row" style="padding:4px 0 0 0; border:none;">' +
+      "<span style='font-weight:800; color:#fff;'>⚡ Включить скрипт (настройки откроются ниже)</span>" +
       "<input type='checkbox' id='cc-script-chk-" +
       scriptObj.id +
       "' " +
       (scriptObj.enabled ? "checked" : "") +
       ">" +
-      "</div>";
+      "</div>" +
+      "<div id='cc-script-dock-slot-" +
+      scriptObj.id +
+      "' style='display:none;'></div>";
 
     listEl.appendChild(card);
+
+    // Если у скрипта уже было создано окно настроек — монтируем его в слот карточки
+    if (scriptObj.enabled && scriptObj.windows.length > 0) {
+      const slot = card.querySelector("#cc-script-dock-slot-" + scriptObj.id);
+      if (slot) {
+        slot.innerHTML = "";
+        slot.appendChild(scriptObj.windows[scriptObj.windows.length - 1].el);
+        slot.style.display = "block";
+      }
+    }
 
     const chk = card.querySelector("#cc-script-chk-" + scriptObj.id);
     if (chk) {
@@ -1309,6 +1282,11 @@
     if (!navList || !mainView) return false;
     if (targetShadow.getElementById("cc-pane-scripts")) return true;
 
+    // Инжектим стили встроенных панелей скриптов в главный ShadowRoot
+    const dockedStyleEl = document.createElement("style");
+    dockedStyleEl.textContent = DOCKED_SCRIPT_STYLES;
+    targetShadow.appendChild(dockedStyleEl);
+
     const tabBtn = document.createElement("button");
     tabBtn.className = "cc-tab-btn";
     tabBtn.dataset.tab = "scripts";
@@ -1321,19 +1299,19 @@
     pane.innerHTML =
       '<div class="cc-glass-card" style="border-left:3.5px solid #c77dff; background:linear-gradient(135deg, rgba(199,125,255,0.14), rgba(0,245,212,0.08));">' +
       '<div class="cc-section-title" style="color:#c77dff;">' +
-      "<span>🧩 CHESSCOACH LUA / JS SCRIPT ENGINE</span>" +
-      "<span id='cc-script-loader-status' style='color:#00f5d4;'>SDK v2.0 (60 FPS)</span>" +
+      "<span>🧩 МЕНЕДЖЕР СКРИПТОВ (ВСТРОЕННЫЕ ВКЛАДКИ)</span>" +
+      "<span id='cc-script-loader-status' style='color:#00f5d4;'>SDK v2.0</span>" +
       "</div>" +
-      "<div style='font-size:10.5px; color:#cbd5e1; line-height:1.38; margin-bottom:8px;'>" +
-      "Положите любой скрипт (например, <code>snake.js</code>) в папку <strong>scripts/</strong>, обновите расширение в браузере и нажмите кнопку ниже, чтобы подключить его без замены <code>sample.js</code>:" +
+      "<div style='font-size:11px; color:#cbd5e1; line-height:1.4; margin-bottom:10px;'>" +
+      "Настройки каждого включенного скрипта открываются <strong>прямо внутри этой вкладки</strong>, не перекрывая шахматную доску. Вы можете загрузить любой <code>.js</code> скрипт из памяти телефона:" +
       "</div>" +
       '<div class="cc-actions-bar">' +
-      '<button class="cc-btn cc-btn-primary" id="cc-add-script-file-btn">📂 ПОДКЛЮЧИТЬ .JS ИЗ ПАПКИ SCRIPTS/</button>' +
+      '<button class="cc-btn cc-btn-primary" id="cc-add-script-file-btn">📂 ЗАГРУЗИТЬ .JS СКРИПТ</button>' +
       '<button class="cc-btn cc-btn-danger" id="cc-reset-script-files-btn">🗑 СБРОСИТЬ СПИСОК</button>' +
       "</div>" +
       '<input type="file" id="cc-script-file-picker" accept=".js" multiple style="display:none;" />' +
       "</div>" +
-      '<div id="cc-scripts-list-container" style="display:flex; flex-direction:column; gap:7px;"></div>';
+      '<div id="cc-scripts-list-container" style="display:flex; flex-direction:column; gap:10px;"></div>';
 
     mainView.appendChild(pane);
 
@@ -1355,11 +1333,9 @@
           const ok = await loadScriptFileFromFolder(f.name, true);
           if (ok) loadedCount++;
         }
-        if (statusEl) {
-          statusEl.textContent = loadedCount > 0
-            ? "✅ ПОДКЛЮЧЕНО: " + loadedCount + " СКРИПТ(ОВ)"
-            : "⚠️ СНАЧАЛА ОБНОВИТЕ РАСШИРЕНИЕ В CHROME://EXTENSIONS";
-          statusEl.style.color = loadedCount > 0 ? "#38b000" : "#ffbe0b";
+        if (statusEl && loadedCount > 0) {
+          statusEl.textContent = "✅ ПОДКЛЮЧЕНО: " + loadedCount;
+          statusEl.style.color = "#38b000";
         }
       });
     }
@@ -1369,7 +1345,7 @@
         try {
           chrome.storage?.local?.set({ cc_custom_script_files: [] }, () => {
             if (statusEl) {
-              statusEl.textContent = "🔄 СПИСОК ОЧИЩЕН (ОБНОВИТЕ СТРАНИЦУ)";
+              statusEl.textContent = "🔄 СПИСОК ОЧИЩЕН";
               statusEl.style.color = "#ff4d94";
             }
           });
@@ -1471,7 +1447,8 @@
           if (typeof s.dynamicHooks.onEvalUpdate === "function") s.dynamicHooks.onEvalUpdate(snapshot);
         }
       } catch (e) {}
-    });
+    }
+  );
   }, 250);
 
   const globalEntry = {
