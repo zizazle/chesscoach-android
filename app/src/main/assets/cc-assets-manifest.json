@@ -9,8 +9,8 @@
         },
         {
             "path": "bridge/cc-android-polyfill.js",
-            "size": 42284,
-            "sha256": "e0192934542c2fea52e6f7ca3df61da704292b623918f6852374ff562032e242"
+            "size": 42600,
+            "sha256": "226007c47a1bf7467152439e152132ea412f0d45ea5c097d6abec292184c1725"
         },
         {
             "path": "bridge/cc-mobile-launcher-orb.js",
@@ -19,23 +19,28 @@
         },
         {
             "path": "content/chesscom.js",
-            "size": 270611,
-            "sha256": "01923755f5b9efc6cbbefe473c3efa87f772277222f65f2917e5078dcc020f51"
+            "size": 271789,
+            "sha256": "df877fdc613db9c1c2fc0da9f745d2ef7285f5f74757dd7607632ff46e1e4e09"
         },
         {
             "path": "content/content.css",
-            "size": 34974,
-            "sha256": "8f2e4f1379ed0f52c3573f271c1b5931961134ff88c877301396b8f38d02046c"
+            "size": 36207,
+            "sha256": "6621dfc4a7a391b25c8f7db0c569aea260d3a92896a1b85181c0fa51561e2271"
         },
         {
             "path": "content/content.js",
-            "size": 267666,
-            "sha256": "7e78f75839006f32a66ede1303397a0e8e601269373a86988a4e869371ca84dd"
+            "size": 268901,
+            "sha256": "7a403e6c0c5cfe9fab8104b5383d84537d7c41dda798aef84384730e8ac37a40"
         },
         {
             "path": "content/privacy-mask-bootstrap.js",
             "size": 1527,
             "sha256": "bf6aeb4540938f102de342d86dec1ebbffccd364a110447867194aa46f1f1b91"
+        },
+        {
+            "path": "data/chess-openings.COPYING.txt",
+            "size": 314,
+            "sha256": "891c4f91ce73b8b7d30bb77db7a327cb726a88301cd333349cc6517852e41316"
         },
         {
             "path": "data/eco-book.js",
@@ -93,9 +98,34 @@
             "sha256": "c07dad9a00a89f4b1dcba3971d58d8078715556eac0212368e4aab510e1e27c9"
         },
         {
+            "path": "licenses/APACHE-2.0.txt",
+            "size": 11358,
+            "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        },
+        {
+            "path": "licenses/GPL-3.0.txt",
+            "size": 35149,
+            "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+        },
+        {
+            "path": "licenses/THIRD_PARTY_NOTICES.md",
+            "size": 6015,
+            "sha256": "76ab801cb2e05f7e6284747e135fad49806e229fa026c4e5f9c10f1514dc06c3"
+        },
+        {
             "path": "offscreen/offscreen.js",
             "size": 21243,
             "sha256": "94348eb4487ad4591980367374fd88967756127a23df46d03a9775b8e5543006"
+        },
+        {
+            "path": "pages/credits.css",
+            "size": 6781,
+            "sha256": "0643774ae84333d7dd9f6ec0aef29c99d3b7ba010028ede0a277d2661f1a99f5"
+        },
+        {
+            "path": "pages/credits.html",
+            "size": 6784,
+            "sha256": "64cfbec98a73b6c02ceb1fc044f3136359aa4eb56d78c8a4ed0b18c3c19e56b0"
         },
         {
             "path": "scripts/sample.js",
@@ -109,8 +139,8 @@
         },
         {
             "path": "vendor/stockfish/SOURCE.txt",
-            "size": 601,
-            "sha256": "6e558eab1137fccf1a6d0b5fa384a7195ee08170728f3e2b99129a5205497252"
+            "size": 2237,
+            "sha256": "2555397a9c3b3e4327274ffd3c04774897c407a55fa9b7b55ea3bdd615a2c68a"
         },
         {
             "path": "vendor/stockfish/stockfish-19-single.js",

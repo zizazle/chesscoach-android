@@ -7,18 +7,23 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.Message
 import android.os.PowerManager
 import android.os.SystemClock
 import android.view.InputDevice
+import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -26,9 +31,17 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.PopupMenu
+import android.widget.ProgressBar
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.app.AlertDialog
+import androidx.browser.customtabs.CustomTabColorSchemeParams
+import androidx.browser.customtabs.CustomTabsIntent
 import androidx.core.content.ContextCompat
 import androidx.core.graphics.toColorInt
 import androidx.core.view.ViewCompat
@@ -51,6 +64,11 @@ import java.util.concurrent.Future
 
 class MainActivity : AppCompatActivity() {
     private lateinit var rootLayout: FrameLayout
+    private lateinit var browserContainer: FrameLayout
+    private lateinit var browserAddress: TextView
+    private lateinit var browserProgress: ProgressBar
+    private lateinit var browserForward: Button
+    private lateinit var browserReload: Button
     private lateinit var mainWebView: WebView
     private lateinit var engineWebView: WebView
     private lateinit var storageRepository: AtomicStorageRepository
@@ -72,6 +90,12 @@ class MainActivity : AppCompatActivity() {
     private val touchLimiter = SlidingWindowLimiter(12, 5_000L)
     private var pendingTouch: PendingTouchRequest? = null
     private var dispatchingNativeTouch = false
+    private val browserPopups = mutableListOf<WebView>()
+    private val authenticationWindows = mutableSetOf<WebView>()
+    private val popupWebView: WebView? get() = browserPopups.lastOrNull()
+    private var pendingMainReload = false
+    private var googleSignInDialog: AlertDialog? = null
+    private var loadErrorDialog: AlertDialog? = null
 
     private val assetLoader by lazy {
         WebViewAssetLoader.Builder()
@@ -122,12 +146,14 @@ class MainActivity : AppCompatActivity() {
         setContentView(rootLayout)
 
         engineWebView = createEngineWebView().also { rootLayout.addView(it, 0) }
-        mainWebView = createMainWebView().also { rootLayout.addView(it) }
+        createBrowserChrome()
+        mainWebView = createMainWebView().also { browserContainer.addView(it) }
         ViewCompat.setOnApplyWindowInsetsListener(rootLayout) { view, insets ->
             val bars = insets.getInsets(
                 WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
             )
-            view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+            view.setPadding(bars.left, bars.top, bars.right, maxOf(bars.bottom, ime.bottom))
             insets
         }
         ViewCompat.requestApplyInsets(rootLayout)
@@ -157,10 +183,14 @@ class MainActivity : AppCompatActivity() {
                 FrameLayout.LayoutParams.MATCH_PARENT
             )
         }
-        configureSecureSettings(view)
+        configureSecureSettings(view, browsing = true)
+        // Native board gestures rely on an unzoomed CSS viewport.
+        view.settings.setSupportZoom(false)
+        view.settings.builtInZoomControls = false
         registerRemoteBridge(view)
         installDocumentStartScripts(view)
         view.webViewClient = createMainWebViewClient()
+        view.webChromeClient = createBrowserWebChromeClient()
         view.setOnTouchListener { _, event ->
             if (!dispatchingNativeTouch && event.actionMasked == MotionEvent.ACTION_DOWN) {
                 cancelPendingTouch("USER_INPUT", "A user touch cancelled the native gesture")
@@ -187,7 +217,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private fun configureSecureSettings(view: WebView) {
+    private fun configureSecureSettings(view: WebView, browsing: Boolean = false) {
         view.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
@@ -201,10 +231,12 @@ class MainActivity : AppCompatActivity() {
             safeBrowsingEnabled = true
             mediaPlaybackRequiresUserGesture = true
             javaScriptCanOpenWindowsAutomatically = false
-            setSupportMultipleWindows(false)
-            setSupportZoom(false)
-            builtInZoomControls = false
+            setSupportMultipleWindows(browsing)
+            setSupportZoom(browsing)
+            builtInZoomControls = browsing
             displayZoomControls = false
+            useWideViewPort = browsing
+            loadWithOverviewMode = browsing
             cacheMode = WebSettings.LOAD_DEFAULT
             val standardUserAgent = userAgentString.orEmpty()
             if (!standardUserAgent.contains(USER_AGENT_TOKEN)) {
@@ -213,24 +245,19 @@ class MainActivity : AppCompatActivity() {
         }
         CookieManager.getInstance().apply {
             setAcceptCookie(true)
-            setAcceptThirdPartyCookies(view, false)
+            setAcceptThirdPartyCookies(view, browsing)
         }
     }
 
     private fun createMainWebViewClient(): WebViewClient = object : WebViewClient() {
         override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
             if (!request.isForMainFrame) return false
-            if (isTrustedRemoteUri(request.url)) return false
-            openExternal(request.url)
-            return true
+            return routeBrowserNavigation(view, request.url, request.hasGesture())
         }
 
         @Deprecated("Deprecated in Android")
         override fun shouldOverrideUrlLoading(view: WebView, url: String): Boolean {
-            val uri = Uri.parse(url)
-            if (isTrustedRemoteUri(uri)) return false
-            openExternal(uri)
-            return true
+            return routeBrowserNavigation(view, Uri.parse(url), userGesture = false)
         }
 
         override fun shouldInterceptRequest(
@@ -243,17 +270,19 @@ class MainActivity : AppCompatActivity() {
         override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
             pageGeneration++
             cancelRemoteWork("NAVIGATION_CANCELLED", "Document navigation cancelled the request")
+            loadErrorDialog?.dismiss()
             val uri = Uri.parse(url)
-            if (!isTrustedRemoteUri(uri)) {
+            if (BrowserNavigationPolicy.classify(url) != BrowserNavigationPolicy.Destination.GAME) {
                 view.stopLoading()
-                openExternal(uri)
+                routeBrowserNavigation(view, uri, userGesture = false)
                 return
             }
+            updateBrowserChrome(view, url)
             super.onPageStarted(view, url, favicon)
         }
 
         override fun onPageCommitVisible(view: WebView, url: String) {
-            if (!isTrustedRemoteUri(Uri.parse(url))) {
+            if (BrowserNavigationPolicy.classify(url) != BrowserNavigationPolicy.Destination.GAME) {
                 view.stopLoading()
                 return
             }
@@ -262,8 +291,23 @@ class MainActivity : AppCompatActivity() {
 
         override fun onPageFinished(view: WebView, url: String) {
             super.onPageFinished(view, url)
-            if (!isTrustedRemoteUri(Uri.parse(url))) return
+            CookieManager.getInstance().flush()
+            updateBrowserChrome(view, url)
+            if (!isTrustedRemoteUri(Uri.parse(url)) || BrowserNavigationPolicy.isAccountPage(url)) return
             injectMainBundle(view, url, pageGeneration, 0)
+        }
+
+        override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
+            super.doUpdateVisitedHistory(view, url, isReload)
+            updateBrowserChrome(view, url.orEmpty())
+        }
+
+        override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+            if (request.isForMainFrame) showBrowserError(view, "Не удалось загрузить страницу. Проверьте подключение и обновите Android System WebView.")
+        }
+
+        override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, response: WebResourceResponse) {
+            if (request.isForMainFrame && response.statusCode >= 500) showBrowserError(view, "Сайт временно недоступен (HTTP ${response.statusCode}).")
         }
 
         override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
@@ -271,6 +315,318 @@ class MainActivity : AppCompatActivity() {
             recoverMainRenderer(detail.didCrash())
             return true
         }
+    }
+
+    private fun createBrowserChrome() {
+        val column = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = FrameLayout.LayoutParams(-1, -1)
+        }
+        val toolbar = LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor("#101A25".toColorInt())
+            layoutParams = LinearLayout.LayoutParams(-1, dp(48))
+        }
+        toolbar.addView(browserButton("\u2039", "Назад") { handleBrowserBack() })
+        browserForward = browserButton("\u203a", "Вперёд") { activeBrowser().goForward() }
+        toolbar.addView(browserForward)
+        browserAddress = TextView(this).apply {
+            setTextColor("#C9D8E4".toColorInt())
+            textSize = 11f
+            maxLines = 2
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setPadding(dp(6), 0, dp(6), 0)
+            text = "ChessCoach FREE"
+            contentDescription = "Адрес открытого сайта"
+            setOnClickListener {
+                val uri = Uri.parse(activeBrowser().url.orEmpty())
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("Открытый сайт")
+                    .setMessage(if (uri.scheme == "https") "https://${uri.encodedAuthority}" else "Страница ещё не загружена")
+                    .setPositiveButton("Закрыть", null).show()
+            }
+        }
+        toolbar.addView(browserAddress, LinearLayout.LayoutParams(0, -2, 1f))
+        browserReload = browserButton("\u21bb", "Обновить страницу") {
+            val view = activeBrowser()
+            if (view.progress < 100) view.stopLoading() else view.reload()
+        }
+        toolbar.addView(browserReload)
+        val menuButton = browserButton("...", "Меню браузера") {}
+        menuButton.setOnClickListener { showBrowserMenu(menuButton) }
+        toolbar.addView(menuButton)
+        column.addView(toolbar)
+        browserProgress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            progressTintList = android.content.res.ColorStateList.valueOf("#62DFC2".toColorInt())
+            visibility = View.INVISIBLE
+        }
+        column.addView(browserProgress, LinearLayout.LayoutParams(-1, dp(2)))
+        browserContainer = FrameLayout(this)
+        column.addView(browserContainer, LinearLayout.LayoutParams(-1, 0, 1f))
+        rootLayout.addView(column)
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private fun browserButton(label: String, description: String, action: () -> Unit): Button = Button(this).apply {
+        text = label
+        contentDescription = description
+        textSize = 23f
+        typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+        setTextColor("#82ECD1".toColorInt())
+        setBackgroundColor(Color.TRANSPARENT)
+        minWidth = 0
+        minimumWidth = 0
+        setPadding(0, 0, 0, 0)
+        layoutParams = LinearLayout.LayoutParams(dp(44), dp(48))
+        setOnClickListener { action() }
+    }
+
+    private fun activeBrowser(): WebView = popupWebView ?: mainWebView
+
+    private fun updateBrowserChrome(view: WebView, url: String = view.url.orEmpty()) {
+        if (isDestroyedState || view !== activeBrowser()) return
+        val host = if (BrowserNavigationPolicy.classify(url) == BrowserNavigationPolicy.Destination.CREDITS) "О проекте" else Uri.parse(url).host.orEmpty()
+        browserAddress.text = "ChessCoach FREE\n$host"
+        browserForward.isEnabled = view.canGoForward()
+        browserReload.text = if (view.progress < 100) "\u00d7" else "\u21bb"
+        browserReload.contentDescription = if (view.progress < 100) "Остановить загрузку" else "Обновить страницу"
+        browserProgress.progress = view.progress
+        browserProgress.visibility = if (view.progress < 100) View.VISIBLE else View.INVISIBLE
+    }
+
+    private fun showBrowserMenu(anchor: View) {
+        val menu = PopupMenu(this, anchor)
+        menu.menu.add(0, 1, 0, "Войти в Chess.com")
+        menu.menu.add(0, 2, 1, "Открыть Chess.com")
+        menu.menu.add(0, 3, 2, "Открыть Lichess")
+        menu.menu.add(0, 4, 3, "О проекте и благодарности")
+        if (popupWebView != null) menu.menu.add(0, 5, 4, "Закрыть вкладку")
+        menu.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                1 -> openGamePage(BrowserNavigationPolicy.CHESS_COM_LOGIN)
+                2 -> openGamePage(Platform.CHESS_COM.url)
+                3 -> openGamePage(Platform.LICHESS.url)
+                4 -> openBrowserPopup(Uri.parse(BrowserNavigationPolicy.CREDITS_URL))
+                5 -> closeBrowserPopup()
+            }
+            true
+        }
+        menu.show()
+    }
+
+    private fun openGamePage(url: String) {
+        closeAllBrowserPopups(restoreMain = false)
+        pendingMainReload = false
+        val platform = platformForUri(Uri.parse(url)) ?: return
+        storageExecutor.execute {
+            val saved = try {
+                storageRepository.set(JSONObject().put(PLATFORM_STORAGE_KEY, platform.storageValue))
+                true
+            } catch (_: Exception) { false }
+            mainHandler.post {
+                if (isDestroyedState) return@post
+                if (saved) storageRevision++
+                installDocumentStartScripts(mainWebView)
+                if (isResumedState) mainWebView.onResume()
+                mainWebView.loadUrl(url)
+                if (!saved) Toast.makeText(this, "Не удалось сохранить выбор площадки. Страница всё равно открыта.", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    private fun routeBrowserNavigation(view: WebView, uri: Uri, userGesture: Boolean): Boolean {
+        return when (BrowserNavigationPolicy.classify(uri.toString())) {
+            BrowserNavigationPolicy.Destination.GAME -> false
+            BrowserNavigationPolicy.Destination.GOOGLE_AUTH -> {
+                showGoogleSignInHelp()
+                true
+            }
+            BrowserNavigationPolicy.Destination.WEB -> {
+                if (view === popupWebView) false else {
+                    openBrowserPopup(uri)
+                    true
+                }
+            }
+            BrowserNavigationPolicy.Destination.CREDITS -> {
+                if (view === popupWebView) false else {
+                    openBrowserPopup(uri)
+                    true
+                }
+            }
+            BrowserNavigationPolicy.Destination.EXTERNAL_APP -> {
+                if (userGesture) openExternal(uri)
+                true
+            }
+            BrowserNavigationPolicy.Destination.BLOCKED -> {
+                Toast.makeText(this, "Небезопасный или неподдерживаемый адрес заблокирован", Toast.LENGTH_SHORT).show()
+                true
+            }
+        }
+    }
+
+    private fun showGoogleSignInHelp() {
+        if (googleSignInDialog?.isShowing == true || isDestroyedState) return
+        closeAllBrowserPopups()
+        if (BrowserNavigationPolicy.classify(mainWebView.url.orEmpty()) != BrowserNavigationPolicy.Destination.GAME) {
+            mainWebView.loadUrl(BrowserNavigationPolicy.CHESS_COM_LOGIN)
+        }
+        googleSignInDialog = AlertDialog.Builder(this)
+            .setTitle("Вход через Google")
+            .setMessage("Google не разрешает вход во встроенном WebView. Чтобы войти именно в приложение, используйте логин и пароль Chess.com. Если аккаунт создан через Google, задайте пароль через восстановление на Chess.com.\n\nМожно открыть защищённую вкладку браузера с новой сессией входа. Она не переносит авторизацию в приложение.")
+            .setPositiveButton("Войти паролем") { _, _ -> openGamePage(BrowserNavigationPolicy.CHESS_COM_LOGIN) }
+            .setNeutralButton("Вкладка браузера") { _, _ ->
+                // Restart at Chess.com: continuing Google's URL would lose the WebView OAuth state cookie.
+                openExternal(Uri.parse(BrowserNavigationPolicy.CHESS_COM_LOGIN))
+            }
+            .setNegativeButton("Отмена", null)
+            .create().also { it.show() }
+    }
+
+    private fun createBrowserWebChromeClient(): WebChromeClient = object : WebChromeClient() {
+        override fun onProgressChanged(view: WebView, newProgress: Int) {
+            updateBrowserChrome(view)
+        }
+
+        override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message): Boolean {
+            if (!isUserGesture || isDestroyedState) return false
+            if (browserPopups.size >= 3) {
+                Toast.makeText(this@MainActivity, "Сначала закройте одну из открытых вкладок", Toast.LENGTH_SHORT).show()
+                return false
+            }
+            val transport = resultMsg.obj as? WebView.WebViewTransport ?: return false
+            val popup = createBrowserPopup()
+            transport.webView = popup
+            resultMsg.sendToTarget()
+            return true
+        }
+
+        override fun onCloseWindow(window: WebView) {
+            if (window === popupWebView) closeBrowserPopup()
+            else if (browserPopups.remove(window)) {
+                pendingMainReload = authenticationWindows.remove(window) || pendingMainReload
+                detachAndDestroyWebView(window, REMOTE_BRIDGE_NAME)
+            }
+        }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun createBrowserPopup(): WebView {
+        val parent = activeBrowser()
+        val inheritsAuthFlow = parent in authenticationWindows || BrowserNavigationPolicy.isAccountPage(parent.url.orEmpty())
+        cancelRemoteWork("BROWSER_OPEN", "A browser window paused game interaction")
+        mainWebView.evaluateJavascript("window.dispatchEvent(new CustomEvent('cc-mobile-lifecycle',{detail:{state:'settings',cancelPendingMoves:true}}));", null)
+        parent.onPause()
+        if (parent !== mainWebView) parent.visibility = View.GONE
+        val popup = WebView(this).apply {
+            setBackgroundColor("#06080E".toColorInt())
+            layoutParams = FrameLayout.LayoutParams(-1, -1)
+        }
+        // Browsing/authentication windows share WebView cookies, never the engine/native bridge.
+        configureSecureSettings(popup, browsing = true)
+        browserPopups.add(popup)
+        if (inheritsAuthFlow) authenticationWindows.add(popup)
+        popup.webChromeClient = createBrowserWebChromeClient()
+        popup.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                if (!request.isForMainFrame) return false
+                return routeBrowserNavigation(view, request.url, request.hasGesture())
+            }
+
+            @Deprecated("Deprecated in Android")
+            override fun shouldOverrideUrlLoading(view: WebView, url: String): Boolean =
+                routeBrowserNavigation(view, Uri.parse(url), userGesture = false)
+
+            override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? =
+                if (isAppAssetUri(request.url)) assetLoader.shouldInterceptRequest(request.url) else null
+
+            override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
+                if (url == "about:blank") return
+                loadErrorDialog?.dismiss()
+                if (BrowserNavigationPolicy.isAccountPage(url)) authenticationWindows.add(view)
+                val destination = BrowserNavigationPolicy.classify(url)
+                if (destination == BrowserNavigationPolicy.Destination.BLOCKED || destination == BrowserNavigationPolicy.Destination.GOOGLE_AUTH || destination == BrowserNavigationPolicy.Destination.EXTERNAL_APP) {
+                    view.stopLoading()
+                    routeBrowserNavigation(view, Uri.parse(url), userGesture = false)
+                    return
+                }
+                updateBrowserChrome(view, url)
+            }
+
+            override fun onPageFinished(view: WebView, url: String) {
+                CookieManager.getInstance().flush()
+                updateBrowserChrome(view, url)
+            }
+
+            override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
+                super.doUpdateVisitedHistory(view, url, isReload)
+                updateBrowserChrome(view, url.orEmpty())
+            }
+
+            override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+                if (request.isForMainFrame) showBrowserError(view, "Не удалось загрузить страницу. Проверьте соединение; небезопасные соединения не разрешены.")
+            }
+
+            override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+                if (view in browserPopups) closeAllBrowserPopups()
+                return true
+            }
+        }
+        browserContainer.addView(popup)
+        updateBrowserChrome(popup)
+        return popup
+    }
+
+    private fun openBrowserPopup(uri: Uri) {
+        if (popupWebView?.url == uri.toString()) return
+        if (browserPopups.size >= 3) {
+            Toast.makeText(this, "Сначала закройте одну из открытых вкладок", Toast.LENGTH_SHORT).show()
+            return
+        }
+        createBrowserPopup().loadUrl(uri.toString())
+    }
+
+    private fun closeBrowserPopup(restoreMain: Boolean = true) {
+        val popup = popupWebView ?: return
+        browserPopups.remove(popup)
+        pendingMainReload = authenticationWindows.remove(popup) || pendingMainReload
+        loadErrorDialog?.dismiss()
+        detachAndDestroyWebView(popup, REMOTE_BRIDGE_NAME)
+        CookieManager.getInstance().flush()
+        if (isDestroyedState || !restoreMain) return
+        val parent = popupWebView
+        if (parent != null) {
+            parent.visibility = View.VISIBLE
+            if (isResumedState) parent.onResume()
+            updateBrowserChrome(parent)
+        } else {
+            resumeMainBrowser()
+        }
+    }
+
+    private fun closeAllBrowserPopups(restoreMain: Boolean = true) {
+        while (popupWebView != null) closeBrowserPopup(restoreMain = false)
+        if (restoreMain) resumeMainBrowser()
+    }
+
+    private fun resumeMainBrowser() {
+        if (isDestroyedState || !isResumedState || popupWebView != null) return
+        mainWebView.onResume()
+        mainWebView.evaluateJavascript("window.dispatchEvent(new CustomEvent('cc-mobile-lifecycle',{detail:{state:window.__CC_ANDROID_SETTINGS_OPEN__?'settings':'active',cancelPendingMoves:true}}));", null)
+        if (pendingMainReload) {
+            pendingMainReload = false
+            mainWebView.reload()
+        }
+        updateBrowserChrome(mainWebView)
+    }
+
+    private fun showBrowserError(view: WebView, message: String) {
+        if (isDestroyedState || view !== activeBrowser() || loadErrorDialog?.isShowing == true) return
+        browserProgress.visibility = View.INVISIBLE
+        loadErrorDialog = AlertDialog.Builder(this).setTitle("Страница не загрузилась").setMessage(message)
+            .setPositiveButton("Повторить") { _, _ -> if (!isDestroyedState && view === activeBrowser()) view.reload() }
+            .setNegativeButton("Закрыть", null).create().also { it.show() }
     }
 
     private fun createEngineWebViewClient(): WebViewClient = object : WebViewClient() {
@@ -386,6 +742,12 @@ class MainActivity : AppCompatActivity() {
                 "storage.clear" -> handleStorageClear(message, replyProxy)
                 "device.profile.get" -> handleDeviceProfileRequest(message, replyProxy, full = false)
                 "platform.switch" -> handlePlatformSwitch(message, replyProxy)
+                "project.open" -> {
+                    BridgeProtocol.requireOnlyKeys(message.payload, emptySet())
+                    require(touchLimiter.tryAcquire()) { "Browser action rate exceeded" }
+                    postReply(replyProxy, BridgeProtocol.response(message.id, "project.open.response", "project", JSONObject().put("ok", true)))
+                    mainHandler.post { if (!isDestroyedState) openBrowserPopup(Uri.parse(BrowserNavigationPolicy.CREDITS_URL)) }
+                }
                 "input.gesture" -> handleTouchGesture(message, replyProxy, sourceView)
                 "input.cancel" -> handleTouchCancel(message, replyProxy)
                 else -> postError(replyProxy, message.id, "UNSUPPORTED_TYPE", "Message type is not supported")
@@ -739,7 +1101,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun isTouchContextCurrent(pending: PendingTouchRequest): Boolean {
         val view = pending.view
-        return !isDestroyedState && isResumedState && view === mainWebView &&
+        return !isDestroyedState && isResumedState && popupWebView == null && view === mainWebView &&
             pending.pageGeneration == pageGeneration && view.url == pending.url &&
             isTrustedRemoteUri(Uri.parse(pending.url)) && view.isAttachedToWindow && view.isShown &&
             view.windowVisibility == View.VISIBLE && view.hasWindowFocus() &&
@@ -891,6 +1253,7 @@ class MainActivity : AppCompatActivity() {
             message.type.startsWith("storage.") -> "storage"
             message.type.startsWith("device.") -> "device"
             message.type.startsWith("platform.") -> "platform"
+            message.type.startsWith("project.") -> "project"
             message.type.startsWith("input.") -> "input"
             else -> "native"
         }
@@ -1238,20 +1601,29 @@ class MainActivity : AppCompatActivity() {
     private fun setupBackNavigation() {
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (isDestroyedState) return
-                val history = mainWebView.copyBackForwardList()
-                val previous = if (history.currentIndex > 0) {
-                    history.getItemAtIndex(history.currentIndex - 1)?.url
-                } else {
-                    null
-                }
-                if (previous != null && isTrustedRemoteUri(Uri.parse(previous))) {
-                    mainWebView.goBack()
-                } else {
-                    finishAfterTransition()
-                }
+                handleBrowserBack()
             }
         })
+    }
+
+    private fun handleBrowserBack() {
+        if (isDestroyedState) return
+        popupWebView?.let { popup ->
+            val history = popup.copyBackForwardList()
+            val previous = if (history.currentIndex > 0) history.getItemAtIndex(history.currentIndex - 1)?.url else null
+            if (previous != null && BrowserNavigationPolicy.classify(previous) in setOf(BrowserNavigationPolicy.Destination.GAME, BrowserNavigationPolicy.Destination.WEB, BrowserNavigationPolicy.Destination.CREDITS)) popup.goBack()
+            else closeBrowserPopup()
+            return
+        }
+        val generation = pageGeneration
+        val initiatingView = mainWebView
+        initiatingView.evaluateJavascript("Boolean(window.__ccHandleAndroidBack && window.__ccHandleAndroidBack());") { handled ->
+            if (isDestroyedState || !isResumedState || popupWebView != null || initiatingView !== mainWebView || generation != pageGeneration || handled == "true") return@evaluateJavascript
+            val history = initiatingView.copyBackForwardList()
+            val previous = if (history.currentIndex > 0) history.getItemAtIndex(history.currentIndex - 1)?.url else null
+            if (previous != null && BrowserNavigationPolicy.classify(previous) == BrowserNavigationPolicy.Destination.GAME) initiatingView.goBack()
+            else finishAfterTransition()
+        }
     }
 
     private fun restoreTrustedState(savedInstanceState: Bundle?): Boolean {
@@ -1261,9 +1633,9 @@ class MainActivity : AppCompatActivity() {
             val history = mainWebView.copyBackForwardList()
             val valid = history.size > 0 && (0 until history.size).all { index ->
                 val url = history.getItemAtIndex(index)?.url ?: return@all false
-                isTrustedRemoteUri(Uri.parse(url))
+                BrowserNavigationPolicy.classify(url) == BrowserNavigationPolicy.Destination.GAME
             }
-            if (!valid || !isTrustedRemoteUri(Uri.parse(restored.currentItem?.url.orEmpty()))) {
+            if (!valid || BrowserNavigationPolicy.classify(restored.currentItem?.url.orEmpty()) != BrowserNavigationPolicy.Destination.GAME) {
                 mainWebView.stopLoading()
                 mainWebView.clearHistory()
                 false
@@ -1284,14 +1656,19 @@ class MainActivity : AppCompatActivity() {
 
     private fun openExternal(uri: Uri) {
         val scheme = uri.scheme?.lowercase() ?: return
-        if (scheme !in setOf("https", "http", "mailto")) return
+        if (scheme !in setOf("https", "mailto", "tel")) return
         try {
-            startActivity(
-                Intent(Intent.ACTION_VIEW, uri)
-                    .addCategory(Intent.CATEGORY_BROWSABLE)
-                    .setComponent(null)
-            )
+            if (scheme == "https") {
+                CustomTabsIntent.Builder()
+                    .setDefaultColorSchemeParams(CustomTabColorSchemeParams.Builder().setToolbarColor("#101A25".toColorInt()).build())
+                    .setShowTitle(true)
+                    .setShareState(CustomTabsIntent.SHARE_STATE_OFF)
+                    .build().launchUrl(this, uri)
+            } else {
+                startActivity(Intent(Intent.ACTION_VIEW, uri).addCategory(Intent.CATEGORY_BROWSABLE).setComponent(null))
+            }
         } catch (_: Exception) {
+            Toast.makeText(this, "Нет приложения для открытия ссылки", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -1371,6 +1748,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun recoverMainRenderer(didCrash: Boolean) {
         cancelRemoteWork("RENDERER_GONE", "Remote renderer was restarted")
+        closeAllBrowserPopups(restoreMain = false)
         val recoveryUrl = mainWebView.url?.takeIf { isTrustedRemoteUri(Uri.parse(it)) } ?: lastPlatform().url
         val oldView = mainWebView
         mainHandler.post {
@@ -1378,7 +1756,7 @@ class MainActivity : AppCompatActivity() {
             mainRendererRecoveries++
             detachAndDestroyWebView(oldView, REMOTE_BRIDGE_NAME)
             mainWebView = createMainWebView()
-            rootLayout.addView(mainWebView)
+            browserContainer.addView(mainWebView)
             mainWebView.loadUrl(recoveryUrl)
             if (didCrash && mainRendererRecoveries <= MAX_RENDERER_RECOVERIES) {
                 Toast.makeText(this, "WebView перезапущен после сбоя", Toast.LENGTH_SHORT).show()
@@ -1428,9 +1806,10 @@ class MainActivity : AppCompatActivity() {
         appLifecycleGeneration++
         isResumedState = true
         if (::mainWebView.isInitialized) {
-            mainWebView.onResume()
+            if (popupWebView == null) resumeMainBrowser()
             mainWebView.resumeTimers()
         }
+        popupWebView?.onResume()
         if (engineNeedsReload) {
             engineNeedsReload = false
             engineWebView = createEngineWebView().also { rootLayout.addView(it, 0) }
@@ -1446,6 +1825,8 @@ class MainActivity : AppCompatActivity() {
         isResumedState = false
         val generation = ++appLifecycleGeneration
         cancelRemoteWork("APP_PAUSED", "Activity is paused")
+        CookieManager.getInstance().flush()
+        popupWebView?.onPause()
         if (::mainWebView.isInitialized) {
             mainWebView.evaluateJavascript(
                 "window.dispatchEvent(new CustomEvent('cc-mobile-lifecycle',{detail:{state:'hidden',cancelPendingMoves:true}}));",
@@ -1485,7 +1866,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
-        if (::mainWebView.isInitialized && isTrustedRemoteUri(Uri.parse(mainWebView.url.orEmpty()))) {
+        if (::mainWebView.isInitialized && BrowserNavigationPolicy.classify(mainWebView.url.orEmpty()) == BrowserNavigationPolicy.Destination.GAME) {
             mainWebView.saveState(outState)
         }
         super.onSaveInstanceState(outState)
@@ -1493,6 +1874,9 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         isDestroyedState = true
+        googleSignInDialog?.dismiss()
+        loadErrorDialog?.dismiss()
+        closeAllBrowserPopups(restoreMain = false)
         removeThermalListener?.invoke()
         removeThermalListener = null
         if (powerReceiverRegistered) {

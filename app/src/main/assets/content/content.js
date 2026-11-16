@@ -1453,6 +1453,12 @@
         </div>
       </div>
 
+      <div id="cc-project-strip" role="note" aria-label="Официальный бесплатный проект">
+        <span class="cc-free-badge">БЕСПЛАТНО</span>
+        <a href="https://t.me/chesscoach_dev" target="_blank" rel="noopener noreferrer" title="Официальный канал ChessCoach">@chesscoach_dev</a>
+        <button type="button" id="cc-project-open" class="cc-project-button">О проекте</button>
+      </div>
+
       <!-- ТРОЙНОЙ ПЕРЕКЛЮЧАТЕЛЬ РЕЖИМОВ: HvH — ВСЕ — LEGIT -->
       <div id="cc-mode-switcher-bar">
         <button class="cc-mode-btn" data-mode="hvh" title="Профиль HvH: 3000 ELO, Стокфиш + Syzygy, Резня 1+0, отключены средний/худший ходы">
@@ -2062,6 +2068,12 @@
     uiAbortController = new AbortController();
     const uiSignal = uiAbortController.signal;
 
+    $("cc-project-open").addEventListener("click", () => {
+      window.__CC_ANDROID_RUNTIME__.nativeRequest("project.open").catch(() => {
+        setAutoStatusText("Не удалось открыть страницу проекта. Обновите приложение.", "#ffbe0b");
+      });
+    });
+
     const header = $("chesscoach-header");
     let dragging = false, ox = 0, oy = 0;
     header.addEventListener("mousedown", (e) => {
@@ -2486,7 +2498,11 @@
     $("cc-auto-test-avg").addEventListener("click", () => {
       if (engineMaxMode) return;
       const state = captureBoardState(true);
-      const move = cachedMoves.average || cachedMoves.best;
+      const move = cachedMoves.average;
+      if (!move || move.uci === cachedMoves.best?.uci) {
+        setAutoStatusText("Отдельная средняя линия недоступна: дождитесь анализа или выберите лучший ход.", "#ffbe0b");
+        return;
+      }
       if (state && !state.animating && move && isCachedAnalysisCurrent(state)) {
         setAutoStatusText(`Средний ход: ${move.from}→${move.to}`, "#ffbe0b");
         executeMoveOnBoard(move, state, true, false);
@@ -5228,7 +5244,7 @@
     let updatedAvg = baseRes.average;
     const averageLine = [1, 2, 3]
       .map(index => wasmOut.lines[index])
-      .find(line => line && line.uci !== updatedBest.uci && !(line.isMate && Number(line.mateIn) < 0) && (!safeSet || safeSet.has(line.uci)));
+      .find(line => line && line.uci !== updatedBest.uci && !(line.isMate && Number(line.mateIn) < 0) && (!legalSet || legalSet.has(line.uci)) && !hardRejectedSet?.has(line.uci) && (!safeSet || safeSet.has(line.uci)));
     if (averageLine) {
       const l2 = averageLine;
       if (!safeSet || safeSet.has(l2.uci)) {
@@ -5313,6 +5329,7 @@
 
   function applyAnalysisResult(state, res, isDeepPass = false, prevBestUci = "") {
     if (!res || res.error) return;
+    if (res.average && res.average.uci === res.best?.uci) res = { ...res, average: null };
     const resultMeta = res.meta || null;
     if (resultMeta && !isCurrentAnalysisMeta(resultMeta)) return;
     const requiresFinalDisplay = engineMaxMode || currentElo >= 2000;
@@ -5324,7 +5341,7 @@
       return;
     }
     const qualityRank = res.best?.fromSyzygy ? 60 : res.engineMeta ? 50 : isDeepPass ? 30 : 10;
-    if (cachedMoves?.positionId === positionId && Number(cachedMoves.qualityRank || 0) > qualityRank) return;
+    if (cachedMoves?.positionId === positionId && cachedMoves.meta?.analysisId === positionAnalysisId && Number(cachedMoves.qualityRank || 0) > qualityRank) return;
     if (!isDeepPass && res.lastOpponentMove) {
       updateBehavioralCheatDetector(res);
     }
@@ -5826,7 +5843,7 @@
     const isTurboActive = Boolean(currentElo < 2000 && (bulletTurboMode || (workMode !== "legit" && mySecs <= 15)));
     const historyTrusted = Boolean(gameStartedFromInitial && state.sideToAnalyze === state.actualTurn);
     const engineUciHistory = historyTrusted ? uciHistoryList : [];
-    const needAvg = Boolean(!engineMaxMode && currentElo < 2000 && (showAverageMove || useAverageMoveSometimes) && workMode !== "hvh");
+    const needAvg = Boolean(!engineMaxMode && (showAverageMove || (currentElo < 2000 && useAverageMoveSometimes)) && workMode !== "hvh");
     const needWorst = Boolean(!engineMaxMode && currentElo < 2000 && showWorstMove && workMode === "all");
 
     safeSendMessage(

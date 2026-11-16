@@ -1438,6 +1438,12 @@
         </div>
       </div>
 
+      <div id="cc-project-strip" role="note" aria-label="Официальный бесплатный проект">
+        <span class="cc-free-badge">БЕСПЛАТНО</span>
+        <a href="https://t.me/chesscoach_dev" target="_blank" rel="noopener noreferrer" title="Официальный канал ChessCoach">@chesscoach_dev</a>
+        <button type="button" id="cc-project-open" class="cc-project-button">О проекте</button>
+      </div>
+
       <!-- ПЕРЕКЛЮЧАТЕЛЬ РЕЖИМОВ CHESS.COM -->
       <div id="cc-mode-switcher-bar">
         <button class="cc-mode-btn" data-mode="hvh" style="opacity:0.35;" title="Режим HvH (Резня) заблокирован на Chess.com для 100% защиты от бана">
@@ -2112,6 +2118,11 @@
     if (uiAbortController) uiAbortController.abort();
     uiAbortController = new AbortController();
     const uiSignal = uiAbortController.signal;
+    $("cc-project-open").addEventListener("click", () => {
+      window.__CC_ANDROID_RUNTIME__.nativeRequest("project.open").catch(() => {
+        setAutoStatusText("Не удалось открыть страницу проекта. Обновите приложение.", "#ffbe0b");
+      });
+    });
     const header = $("chesscoach-header");
     let dragging = false, ox = 0, oy = 0;
     header.addEventListener("mousedown", (e) => {
@@ -2493,7 +2504,11 @@
     $("cc-auto-test-avg").addEventListener("click", () => {
       if (usesStrictBestMovePolicy()) return;
       const state = captureBoardState(true);
-      const move = cachedMoves.average || cachedMoves.best;
+      const move = cachedMoves.average;
+      if (!move || move.uci === cachedMoves.best?.uci) {
+        setAutoStatusText("Отдельная средняя линия недоступна: дождитесь анализа или выберите лучший ход.", "#ffbe0b");
+        return;
+      }
       if (state && !state.animating && move && isCachedAnalysisCurrent(state)) {
         setAutoStatusText(`Средний ход (2-я линия): ${move.from}→${move.to}`, "#ffbe0b");
         executeMoveOnBoard(move, state, true);
@@ -5266,6 +5281,7 @@
 
   function applyAnalysisResult(state, res, isDeepPass = false, prevBestUci = "") {
     if (!res || res.error) return;
+    if (res.average && res.average.uci === res.best?.uci) res = { ...res, average: null };
     if (isNegativeMateMove(res.average)) res = { ...res, average: null };
     const resultMeta = res.meta || null;
     if (resultMeta && !isCurrentAnalysisMeta(resultMeta)) return;
@@ -5277,7 +5293,7 @@
       return;
     }
     const qualityRank = res.best?.fromSyzygy ? 60 : res.engineMeta ? 50 : isDeepPass ? 30 : 10;
-    if (cachedMoves?.positionId === positionId && Number(cachedMoves.qualityRank || 0) > qualityRank) return;
+    if (cachedMoves?.positionId === positionId && cachedMoves.meta?.analysisId === positionAnalysisId && Number(cachedMoves.qualityRank || 0) > qualityRank) return;
     if (!isDeepPass && res.lastOpponentMove) {
       updateBehavioralCheatDetector(res);
     }
@@ -5598,7 +5614,7 @@
     const mySecs = getMyRemainingSeconds();
     const enemySecs = getEnemyRemainingSeconds();
     const strictBestPolicy = usesStrictBestMovePolicy();
-    const needAvg = Boolean(!strictBestPolicy && (showAverageMove || useAverageMoveSometimes || autoT1LimiterEnabled));
+    const needAvg = Boolean(!engineMaxMode && (showAverageMove || (!strictBestPolicy && (useAverageMoveSometimes || autoT1LimiterEnabled))));
     const needWorst = Boolean(!strictBestPolicy && showWorstMove && workMode === "all");
     const historyTrustedForState = Boolean(gameStartedFromInitial && state.sideToAnalyze === state.actualTurn);
 

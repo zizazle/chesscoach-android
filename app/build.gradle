@@ -89,9 +89,17 @@ android {
 dependencies {
     implementation 'androidx.core:core-ktx:1.18.0'
     implementation 'androidx.appcompat:appcompat:1.8.0'
+    implementation 'androidx.browser:browser:1.9.0'
     implementation 'androidx.webkit:webkit:1.18.0'
     testImplementation 'junit:junit:4.13.2'
     testImplementation 'org.json:json:20240303'
+}
+
+def prepareDistributionNotices = tasks.register('prepareDistributionNotices', Sync) {
+    from(rootProject.file('LICENSE')) { rename { 'GPL-3.0.txt' } }
+    from(rootProject.file('APACHE-2.0.txt'))
+    from(rootProject.file('THIRD_PARTY_NOTICES.md'))
+    into('src/main/assets/licenses')
 }
 
 def bundledAssets = fileTree('src/main/assets') {
@@ -99,6 +107,7 @@ def bundledAssets = fileTree('src/main/assets') {
 }
 def assetManifest = file('src/main/assets/cc-assets-manifest.json')
 def updateAssetManifest = tasks.register('updateAssetManifest') {
+    dependsOn(prepareDistributionNotices)
     inputs.files(bundledAssets)
     inputs.property('appVersion', android.defaultConfig.versionName)
     outputs.file(assetManifest)

@@ -5,13 +5,14 @@
 const http = require("node:http");
 const fs = require("node:fs/promises");
 const path = require("node:path");
+const os = require("node:os");
 const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
 const { once } = require("node:events");
 
 const assetsDir = process.env.CC_BROWSER_ASSETS || path.resolve(__dirname, "../../main/assets");
-const chromePath = process.env.CC_BROWSER_CHROME || "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
-const tempParent = process.env.CC_BROWSER_TEMP || "C:\\Users\\yarps\\AppData\\Local\\Temp\\kilo";
+const chromePath = process.env.CC_BROWSER_CHROME || (process.platform === "win32" ? path.join(process.env.ProgramFiles || "C:\\Program Files", "Google/Chrome/Application/chrome.exe") : process.platform === "darwin" ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" : "/usr/bin/google-chrome");
+const tempParent = process.env.CC_BROWSER_TEMP || os.tmpdir();
 const skipHigh = process.argv.includes("--skip-high");
 const FULL = "stockfish-19-full-single-wasm";
 const LITE = "stockfish-19-lite-asm";

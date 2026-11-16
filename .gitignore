@@ -3,6 +3,11 @@
 .kotlin/
 **/build/
 local.properties
+/artifacts/
+*.apk
+*.aab
+*.apks
+*.idsig
 
 # Local Android SDKs
 sdk/
@@ -15,15 +20,43 @@ android-sdk/
 captures/
 .externalNativeBuild/
 .cxx/
+*.swp
+*.swo
+*~
+
+# JavaScript test output, caches, and logs
+node_modules/
+.npm/
+.cache/
+coverage/
+test-results/
+playwright-report/
+*.log
+logs/
 
 # Signing material and local secrets
 *.jks
 *.keystore
 *.p12
+*.pfx
+*.pem
+*.key
 keystore.properties
 signing.properties
 .env
 .env.*
+!.env.example
+!.env.sample
+!.env.template
+credentials.json
+secrets.json
+*.chess
+*.chess.json
+*.local.json
+
+# Generated Agent Manager state only; retain source configuration
+/.kilo/worktrees/
+/.kilo/agent-manager.json
 
 # Operating system files
 .DS_Store

@@ -717,6 +717,10 @@
   function normalizeNativeRequest(method, rawParams) {
     const params = rawParams === undefined ? {} : rawParams;
     if (!isPlainObject(params)) throw createError("Native request params must be an object", "INVALID_ARGUMENT");
+    if (method === "project.open") {
+      if (Object.keys(params).length) throw createError("Project page takes no params", "INVALID_ARGUMENT");
+      return { channel: "project", type: "project.open", responseType: "project.open.response", payload: {} };
+    }
     if (method === "input.cancel") {
       if (Object.keys(params).length) throw createError("Input cancellation takes no params", "INVALID_INPUT");
       return {
@@ -961,6 +965,7 @@
         envelope.type === "runtime.response" ||
         envelope.type === "storage.response" ||
         envelope.type === "platform.switch.response" ||
+        envelope.type === "project.open.response" ||
         envelope.type === "device.profile.response" ||
         envelope.type === "haptic.response" ||
         envelope.type === "download.response" ||

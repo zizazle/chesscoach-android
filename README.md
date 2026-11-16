@@ -1,41 +1,71 @@
 # ChessCoach Android
 
-Android-оболочка ChessCoach для Lichess и Chess.com. Debug APK автоматически проверяется и собирается в GitHub Actions после каждого push. Signed release APK и AAB собираются только по тегу и только при наличии полного набора signing secrets.
+Android-приложение для работы с Lichess и Chess.com со встроенным шахматным движком Stockfish. Открывайте шахматные площадки в приложении и используйте анализ позиций для обучения и разбора партий.
 
-## Toolchain
+**Версия:** `15.9.0-Mobile` · **Требования:** Android 8.0 или новее.
 
-| Компонент | Версия |
-| --- | --- |
-| Android Gradle Plugin | 8.12.2 |
-| Gradle Wrapper | 8.13 |
-| Kotlin | 2.1.21 |
-| Java | JDK 17 |
-| compileSdk / targetSdk | 36 / 36 |
-| minSdk | 26 |
-| AndroidX Core KTX | 1.18.0 |
-| AndroidX AppCompat | 1.8.0 |
-| AndroidX WebKit | 1.18.0 |
+> [!IMPORTANT]
+> **Открытый исходный код. Официальный ChessCoach и его сборки бесплатны.**
+> Официальный канал: **[t.me/chesscoach_dev](https://t.me/chesscoach_dev)**.
+> Не платите за «доступ к официальной бесплатной сборке». Сторонняя продажа или переименование не делают копию официальной.
 
-Версия приложения: `15.8.1-Mobile` (`versionCode 1581`). Wrapper проверяет официальный SHA-256 Gradle distribution до запуска.
+[Установка](#установка) · [Вход](#вход-в-chesscom) · [Честная игра](#честная-игра) · [Сборка](#сборка-из-исходников) · [Лицензия](#лицензия)
 
-## Runtime и профили телефона
+## Возможности
 
-- WebView сайта принимает только exact HTTPS origins `lichess.org` и `www.chess.com`.
-- Background, offscreen и Stockfish выполняются в отдельном app-owned WebView на `appassets.androidplatform.net`.
-- Native API передаётся через origin-checked WebMessage JSON protocol; глобальный `addJavascriptInterface` не используется.
-- Storage сохраняется атомарно через `AtomicFile`; backup и device transfer для app data запрещены.
-- LOW профиль использует Lite/16 MiB и уменьшенные budgets, BALANCED — Lite/32 MiB, HIGH — full NNUE/64 MiB. Класс выбирается по RAM, heap, CPU, ABI, power-save и thermal status; точная модель остаётся только в локальном engine profile.
-- При background/pause поиски и pending requests отменяются; renderer восстанавливается с ограниченным числом попыток и Lite fallback.
+- Поддержка [Lichess](https://lichess.org) и [Chess.com](https://www.chess.com) внутри приложения.
+- Анализ шахматных позиций с помощью встроенного Stockfish 19.
+- Автоматическая адаптация параметров движка к возможностям телефона.
+- Локальное сохранение настроек на устройстве.
+- Встроенный HUD, визуальные подсказки и [локальная страница проекта и благодарностей](app/src/main/assets/pages/credits.html).
 
-Full Stockfish WASM занимает около 99 MiB, поэтому debug APK имеет размер около 100 MiB. Неподтверждённые портреты, произвольные user scripts, file import/export и custom wallpaper upload в защищённой Android-сборке отключены.
+Профили LOW/BALANCED/HIGH подбирают backend, Hash и бюджеты по ресурсам телефона; при проблемах full NNUE предусмотрен Lite/ASM fallback. Движок включён в приложение: полный WASM занимает около 94,57 МиБ и является необходимым runtime-ресурсом.
 
-## Clone и локальная сборка
+Средняя линия доступна как отдельная легальная альтернатива, в том числе при высоком UI-ELO. Её показ не меняет best-only политику автохода; `ENGINE MAX` и `HvH` используют только основную линию. Если отдельной альтернативы нет, лучший ход не выдаётся за средний. Значения UI-ELO и WDL являются эвристиками, а не сертифицированным рейтингом или вероятностями.
 
-Требуются JDK 17 и Android SDK Platform 36 с Build Tools 36.0.0.
+## Установка
+
+Готовые APK не хранятся в исходном дереве. Сведения о публикации бесплатных сборок ищите в [официальном канале](https://t.me/chesscoach_dev); если готовой сборки нет, используйте [локальную сборку](#сборка-из-исходников).
+
+1. Получите APK из официального канала или соберите его из исходников и перенесите на Android-устройство.
+2. Откройте файл и, если Android попросит, разрешите установку приложений из этого источника.
+3. Установите приложение, откройте его и выберите шахматную площадку.
+
+Для доступа к Lichess и Chess.com требуется интернет. Движок уже включён в APK, отдельно скачивать его не нужно.
+
+Для тестирования предусмотрен [GitHub Actions workflow](https://github.com/zizazle/chesscoach-android/actions/workflows/build-apk.yml). Если там есть успешный запуск `Android CI` с доступным артефактом `-debug-apk`, скачайте ZIP и извлеките APK. Это временный debug-артефакт, а не подтверждение публикации официального release.
+
+## Вход в Chess.com
+
+- **В приложении:** используйте форму Chess.com с логином/email и паролем. Навигация, окна авторизации и cookies обслуживаются браузерной частью WebView, отдельно от движка.
+- **Через Google:** Google не разрешает вход в управляемом встроенном WebView. Приложение показывает пояснение и может открыть Chrome Custom Tab или внешний браузер с **новой полной сессией входа на Chess.com**. Это не продолжение старого OAuth-запроса; авторизация и cookies **не переносятся обратно в приложение**.
+- **Аккаунт создан через Google и пароля нет:** задайте пароль через восстановление на Chess.com, затем используйте вход по паролю внутри приложения.
+
+Ограничение WebView описано в [политике Google OAuth](https://developers.google.com/identity/protocols/oauth2/policies#use-secure-browsers). Успешный вход с реальными провайдерами не проверен сквозными E2E-тестами; доступность формы и дополнительные проверки зависят от самой площадки.
+
+## Честная игра
+
+Используйте анализ для обучения, разбора завершённых партий и в режимах, где помощь движка разрешена правилами площадки. Использование подсказок в партиях против других игроков нарушает правила честной игры Lichess и Chess.com и может привести к блокировке аккаунта.
+
+Названия `legit`, `stealth`, `anti-ban`, задержки и T1 limiter **не гарантируют защиту от обнаружения или бана**. Перед использованием ознакомьтесь с [правилами Lichess](https://lichess.org/terms-of-service) и [Chess.com](https://www.chess.com/legal/fair-play).
+
+## Приватность
+
+Настройки хранятся локально в данных приложения. Страница сайта и app-owned WebView движка разделены; native-обмен сообщениями проверяет origin. Cookies разрешены для браузерной части, включая необходимые для авторизации third-party cookies; сессия внешнего браузера остаётся отдельной.
+
+Для сайтов нужен интернет. Включённые Cloud Eval, Explorer и Syzygy могут передавать FEN позиции внешним API. Privacy Mask меняет только отображение: он не анонимизирует сеть, не удаляет данные с сайта и не защищает от блокировок. Android backup и перенос данных приложения отключены, но это не обещание шифрования всех локальных данных.
+
+Произвольные пользовательские скрипты, импорт/экспорт файлов и загрузка своего фона в защищённой Android-сборке отключены. Не публикуйте cookies, токены, личные конфигурации, keystore или необработанные логи с данными аккаунта.
+
+## Сборка из исходников
+
+Для разработчиков: необходимы JDK 17, Android SDK Platform 36 и Build Tools 36.0.0. Можно открыть проект в Android Studio или собрать его через Gradle Wrapper.
+
+Зафиксированы **Gradle 8.13**, **Android Gradle Plugin 8.12.2** и **Kotlin 2.1.21**. Android-проект является самостоятельным Git-репозиторием, а не частью Git-истории браузерного расширения.
 
 ```bash
-git clone <URL_РЕПОЗИТОРИЯ>
-cd ChessCoach-Android
+git clone https://github.com/zizazle/chesscoach-android.git
+cd chesscoach-android
 ```
 
 Linux/macOS:
@@ -51,76 +81,91 @@ Windows PowerShell:
 .\gradlew.bat lintDebug testDebugUnitTest assembleDebug
 ```
 
-Готовый installable debug APK находится в `app/build/outputs/apk/debug/app-debug.apk`. Это APK с автоматически созданным debug certificate; он предназначен для тестирования, а не для публикации.
+Готовый тестовый APK: `app/build/outputs/apk/debug/app-debug.apk`.
 
-Если SDK не определяется через `ANDROID_HOME` или `ANDROID_SDK_ROOT`, создайте локальный `local.properties`:
+Debug APK использует debug-ключ и предназначен для тестирования; он не подтверждает происхождение официального release.
+
+Если Gradle не находит Android SDK, укажите путь к нему в локальном файле `local.properties`, например для Windows:
 
 ```properties
 sdk.dir=C\:\\Users\\you\\AppData\\Local\\Android\\Sdk
 ```
 
-`local.properties`, SDK, build-каталоги и keystore-файлы исключены из Git.
+`local.properties`, кеши, build-каталоги, APK/AAB, личные конфигурации и ключи исключены из Git. Gradle Wrapper, lock-файлы, исходные настройки и vendor assets остаются частью исходной поставки.
 
-## Загрузка существующей папки в GitHub
+Удалённые из текущей папки APK остаются в старых коммитах. `.gitignore` не очищает Git-историю; перед её публикацией отдельно проверьте старые файлы и секреты. История репозитория сохранена.
 
-Создайте пустой GitHub repository без автоматически добавленных README или LICENSE, затем выполните из этой папки:
+### Проверки JavaScript и браузерных страниц
+
+Нужен Node.js 22 или 24; установка npm-зависимостей не требуется. Выполняйте из корня Android-репозитория:
 
 ```bash
-git init
-git add .
-git commit -m "Initial Android source"
-git branch -M main
-git remote add origin https://github.com/<OWNER>/<REPOSITORY>.git
-git push -u origin main
+node --test app/src/test/js/*.test.cjs
+node app/src/test/js/engine-host.browser.cjs
+node app/src/test/js/mobile-launcher.browser.cjs
 ```
 
-После push откройте `Actions` -> `Android CI`. Job `Lint, test, and build debug APK` выполняет Wrapper validation, `lintDebug`, `testDebugUnitTest` и `assembleDebug`. Установочный APK, файл `.sha256`, GPL/Apache license texts и third-party notice доступны в artifact с именем `ChessCoach-15.8.1-Mobile-<SHA>-debug-apk`.
+Два `.browser.cjs` запускают локальные браузерные fixtures через Chrome/CDP. Нужен установленный Chrome; `CC_BROWSER_CHROME` задаёт путь к нему, `CC_BROWSER_TEMP` переопределяет временный каталог для профилей. Это не сквозная проверка реального Android WebView или успешного входа через провайдеров.
 
-Workflow использует `ubuntu-24.04`, JDK 17, Android SDK 36 и Actions, закреплённые по immutable commit SHA. Права `GITHUB_TOKEN` ограничены `contents: read` только для jobs, которым нужен checkout; Gradle cache включён.
-
-## Signed release по тегу
-
-Release никогда не подписывается debug key. Добавьте в `Settings` -> `Secrets and variables` -> `Actions` следующие repository secrets:
-
-| Secret | Содержимое |
-| --- | --- |
-| `ANDROID_KEYSTORE_BASE64` | Keystore целиком в Base64 без переносов |
-| `STORE_PASSWORD` | Пароль keystore |
-| `KEY_ALIAS` | Alias release-ключа |
-| `KEY_PASSWORD` | Пароль release-ключа |
-
-Linux:
+После свежей сборки можно проверить упакованные assets APK:
 
 ```bash
-base64 -w 0 release.keystore
+node app/src/test/js/apk-integrity.cjs app/build/outputs/apk/debug/app-debug.apk
+```
+
+Скрипт сопоставляет assets и SHA-256 с упакованным `cc-assets-manifest.json`. Он **не проверяет цифровую подпись или личность издателя**. Старые отчёты в `app/build/` не подтверждают целостность новой сборки.
+
+### Release и зависимости
+
+Для сборки неподписанных release APK/AAB оставьте **все четыре** переменные подписи незаданными: `ANDROID_KEYSTORE_FILE`, `STORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`.
+
+Linux/macOS:
+
+```bash
+./gradlew assembleRelease bundleRelease
 ```
 
 Windows PowerShell:
 
 ```powershell
-[Convert]::ToBase64String([IO.File]::ReadAllBytes("release.keystore"))
+.\gradlew.bat assembleRelease bundleRelease
 ```
 
-Запустите release push тегом:
+Результаты находятся в `app/build/outputs/apk/release/` и `app/build/outputs/bundle/release/`. Неподписанный APK нельзя установить до подписи. Для локальной release-подписи требуется полный набор четырёх переменных; частично заданный набор завершает сборку ошибкой. Не помещайте значения или keystore в репозиторий.
 
-```bash
-git tag v15.8.1-Mobile
-git push origin v15.8.1-Mobile
-```
-
-При наличии всех четырёх secrets workflow сначала требует успешный debug quality gate, затем собирает R8-minified signed APK и AAB, проверяет подписи и публикует их вместе с `SHA256SUMS.txt`, GPL/Apache license texts и third-party notice. Если хотя бы одного secret нет, signed release job пропускается; независимый debug job продолжает работать.
-
-## Dependency locks
-
-Gradle dependency locking включён для всех проектов. После намеренного изменения зависимостей обновите lock state и повторите CI-команды:
+Dependency locking включён; версии runtime-зависимостей записаны в [app/gradle.lockfile](app/gradle.lockfile). Только после намеренного изменения зависимостей обновляйте lock state и повторяйте проверки:
 
 ```bash
 ./gradlew :app:dependencies --write-locks
 ./gradlew lintDebug testDebugUnitTest assembleDebug
 ```
 
-## Лицензия и исходный код
+В PowerShell используйте `.\gradlew.bat` с теми же аргументами.
 
-Проект распространяется по GNU GPL v3 или более поздней версии; полный текст находится в [LICENSE](LICENSE). Bundled Stockfish.js является GPL-компонентом, поэтому при распространении APK необходимо одновременно сохранять доступ к соответствующему исходному коду этой версии приложения и Stockfish.js. Точные версии, checksums, copyright и ссылки на upstream source перечислены в [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+## Обратная связь
 
-Lichess и Chess.com являются товарными знаками соответствующих владельцев. Этот репозиторий не заявляет об их одобрении или аффилированности.
+Об ошибках и предложениях можно сообщить в [Issues](https://github.com/zizazle/chesscoach-android/issues). Для отчёта об ошибке укажите версию приложения, версию Android и шаги воспроизведения.
+
+Официальные объявления и обсуждение: [t.me/chesscoach_dev](https://t.me/chesscoach_dev). Перед отправкой отчёта удалите личные данные и токены.
+
+## Благодарности
+
+Спасибо людям, которые поддерживают проект:
+
+| Участник | Наше спасибо |
+| --- | --- |
+| [@norbza](https://t.me/norbza) | эстонский танк |
+| [@ahahebe](https://t.me/ahahebe) | коч братан |
+| [@axlainter](https://t.me/axlainter) | курама |
+
+Страница проекта доступна из меню приложения, в том числе на экране входа, и открывается локально без загрузки удалённых фотографий или скриптов.
+
+## Лицензия
+
+Проект распространяется по **GNU GPL v3 или более поздней версии**. Полный текст лицензии находится в [LICENSE](LICENSE), сведения о Stockfish.js и других сторонних компонентах, включая ссылки на их исходный код, в [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). При распространении готовых сборок необходимо соблюдать условия GPL и предоставлять соответствующий исходный код приложения и Stockfish.js.
+
+Сборка включает локальные копии `LICENSE`, [APACHE-2.0.txt](APACHE-2.0.txt) и [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) в assets, вместе с GPL notice Stockfish и [CC0 provenance ECO-данных](app/src/main/assets/data/chess-openings.COPYING.txt). Для распространения APK/AAB сохраняйте notices и доступ к соответствующим исходникам конкретной версии, включая Stockfish.js, его build scripts и сети NNUE. Одна ссылка на временный CI-артефакт не заменяет эти обязанности.
+
+**GPL разрешает коммерческое распространение.** Бесплатность официальных сборок не вводит запрета продажи или условий Non-Commercial; сторонние форки и сборки не становятся официальными. Приложение предоставляется без гарантий в пределах лицензии.
+
+ChessCoach Android не является официальным приложением Lichess или Chess.com и не связан с этими площадками. Названия и товарные знаки принадлежат их владельцам.
