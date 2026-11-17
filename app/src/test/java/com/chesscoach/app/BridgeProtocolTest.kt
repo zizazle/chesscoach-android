@@ -256,6 +256,35 @@ class BridgeProtocolTest {
         .put("points", JSONArray().put(point(100, 200)))
         .put("viewport", viewport())
         .put("documentToken", "input-doc-test")
+        .put("documentNonce", "native-doc-nonce")
+        .put("targetId", "board-target")
+        .put("snapshot", JSONObject().put("v", 1).put("boardId", "board-1").put("positionKey", "position-1")
+            .put("orientation", "white").put("myColor", "w").put("turn", "w")
+            .put("boardRect", inputRect()).put("targetId", "board-target").put("targetRect", inputRect())
+            .put("hit", true).put("animating", false))
+
+    @Test fun cancellationRequiresAnOriginalRequestIdAndNativeNonceForGestures() {
+        assertThrows(IllegalArgumentException::class.java) {
+            BridgeProtocol.validateTouchCancellation(JSONObject().put("documentToken", "input-doc-test"))
+        }
+        val cancel = BridgeProtocol.validateTouchCancellation(JSONObject().put("requestId", "gesture-old")
+            .put("documentToken", "input-doc-test").put("documentNonce", "native-doc-nonce"))
+        assertEquals("gesture-old", cancel.requestId)
+        assertEquals("native-doc-nonce", cancel.documentNonce)
+    }
+
+    @Test fun rejectsMissingNativeBindingAndMalformedCoreSnapshot() {
+        for (payload in listOf(touchPayload().put("documentNonce", JSONObject.NULL),
+            touchPayload().put("snapshot", JSONObject.NULL),
+            touchPayload().put("targetId", "different-target"))) {
+            assertThrows(IllegalArgumentException::class.java) { BridgeProtocol.validateTouchGesture(payload) }
+        }
+        val invalid = touchPayload()
+        invalid.getJSONObject("snapshot").put("hit", "true")
+        assertThrows(IllegalArgumentException::class.java) { BridgeProtocol.validateTouchGesture(invalid) }
+    }
+
+    private fun inputRect(): JSONObject = JSONObject().put("left", 0).put("top", 0).put("width", 400).put("height", 800)
 
     private fun viewport(): JSONObject = JSONObject()
         .put("width", 400).put("height", 800).put("offsetLeft", 0).put("offsetTop", 0)

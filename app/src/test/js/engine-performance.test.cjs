@@ -262,7 +262,7 @@ test("ordinary supersession drains bestmove, ignores readyok/stale info and reus
   const first = harness.request();
   await flush();
   const worker = harness.workers[0];
-  const second = harness.request();
+  const second = harness.request("ENGINE_ANALYZE", { fen: "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq e6 0 2" });
   await flush();
   assert.equal((await first).code, "SUPERSEDED");
   assert.equal(worker.terminated, false);
@@ -275,7 +275,7 @@ test("ordinary supersession drains bestmove, ignores readyok/stale info and reus
   worker.emit("bestmove e2e4");
   await flush();
   assert.equal(worker.commands.filter(command => command.startsWith("go ")).length, 2);
-  worker.finish("d2d4", "e2e4");
+  worker.finish("d2d4", "g1f3");
   const response = await second;
   assert.equal(response.result.bestUci, "d2d4");
   assert.equal(response.result.primaryLine.isMate, false);
@@ -522,14 +522,18 @@ test("interrupted ELO2500 root analysis preserves every legal UCI, requested alt
 });
 
 test("same-position Stockfish makes mobile deep JS annotation-only, without duplicate PV/traps/network/premove", async () => {
-  const { context } = backgroundContext(profile(), { now: () => 0 });
-  const meta = { sessionId: "owned-session", positionId: 2 };
-  vm.runInContext("stockfishWorkByPosition", context).set(`${meta.sessionId}|${meta.positionId}|${START_FEN}`, { expiresAt: Date.now() + 10000 });
+  const harness = ownedHost();
+  const { context } = harness;
+  const meta = { sessionId: "owned-session", positionId: 2, analysisId: 3, annotationOnly: true, ownedEngineRequestId: "annotation-owner" };
+  const primary = harness.request("ENGINE_ANALYZE", { requestId: "annotation-owner", meta });
+  await flush();
   let extraSearches = 0;
   for (const name of ["searchPV", "computeTrapMetrics", "computeSmartNextPremove", "fetchLichessCloud3000", "fetchSyzygyTablebase"]) {
     context[name] = () => { extraSearches++; throw new Error(`Unnecessary ${name}`); };
   }
-  const result = await context.analyzeAdaptiveMaster(START_FEN, 2500, "balanced", "deep", null, false, true, true, "w", 999, 999, true, [], null, "owned", [], false, meta);
+  const result = await context.analyzeAdaptiveMaster(START_FEN, 2500, "balanced", "deep", null, false, true, true, "w", 999, 999, true, [], null, "1:0:owned-session", [], false, meta);
+  harness.workers[0].finish("e2e4", "d2d4");
+  assert.equal((await primary).ok, true);
   assert.equal(extraSearches, 0);
   assert.equal(result.search.annotationOnly, true);
   assert.equal(result.legalUcis.length, 20);

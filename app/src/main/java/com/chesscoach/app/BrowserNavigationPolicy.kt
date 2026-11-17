@@ -10,8 +10,9 @@ internal object BrowserNavigationPolicy {
     enum class Destination { GAME, GOOGLE_AUTH, WEB, CREDITS, EXTERNAL_APP, BLOCKED }
 
     private val gameHosts = setOf("lichess.org", "www.chess.com", "chess.com")
-    private val accountPath = Regex("^/(?:login|signin|signup|register|oauth|auth|password|reset-password|account/(?:login|signin|password|reset-password))(?:/|$)")
+    private val accountPath = Regex("^/(?:login|signin|signup|register|oauth|auth|callback|authorize|verify|magic(?:-link)?|email(?:-login)?|sso|social|connect|password|reset-password|account/(?:login|signin|password|reset-password|verify))(?:/|$)")
     private val googlePath = Regex("^/(?:login|register|signup|oauth|auth)(?:/[^/]+)*/google(?:/|$)")
+    private val sharedHttpsUrl = Regex("https://[^\\s<>\"']+", RegexOption.IGNORE_CASE)
 
     fun classify(url: String): Destination {
         if (url.isBlank() || url.length > 8192 || url.any { it.isISOControl() }) return Destination.BLOCKED
@@ -35,6 +36,30 @@ internal object BrowserNavigationPolicy {
     }
 
     fun isAccountPage(url: String): Boolean = try {
-        classify(url) == Destination.GAME && accountPath.containsMatchIn(URI(url).path.orEmpty().lowercase(Locale.ROOT))
+        classify(url) in setOf(Destination.GAME, Destination.GOOGLE_AUTH) &&
+            URI(url).host?.lowercase(Locale.ROOT) in gameHosts && accountPath.containsMatchIn(URI(url).path.orEmpty().lowercase(Locale.ROOT))
     } catch (_: Exception) { false }
+
+    fun isSupportedAuthenticationUrl(url: String): Boolean =
+        classify(url) in setOf(Destination.GAME, Destination.WEB, Destination.GOOGLE_AUTH)
+
+    fun extractSupportedAuthenticationUrl(text: String): String? {
+        if (text.isBlank() || text.length > 16_384 || text.any { it.isISOControl() && !it.isWhitespace() }) return null
+        val direct = text.trim()
+        if (isSupportedAuthenticationUrl(direct)) return direct
+        return sharedHttpsUrl.findAll(text).map { it.value.trimEnd('.', ',', ';', ')', ']', '}') }
+            .firstOrNull(::isSupportedAuthenticationUrl)
+    }
+
+    fun isChessComFamilyUrl(url: String): Boolean {
+        if (!isSupportedAuthenticationUrl(url)) return false
+        return try {
+            val host = URI(url).host?.lowercase(Locale.ROOT) ?: return false
+            host == "chess.com" || host.endsWith(".chess.com")
+        } catch (_: Exception) { false }
+    }
+
+    fun canAdoptAuthenticationWindow(url: String, authenticationWindow: Boolean, progress: Int, hasParentWindow: Boolean = false): Boolean =
+        authenticationWindow && !hasParentWindow && progress == 100 && classify(url) == Destination.GAME &&
+            URI(url).host?.lowercase(Locale.ROOT) in setOf("www.chess.com", "chess.com") && !isAccountPage(url)
 }

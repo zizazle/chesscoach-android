@@ -1,26 +1,36 @@
 {
-    "version": "15.9.0-Mobile",
+    "version": "16.0.3-Mobile",
     "hashAlgorithm": "SHA-256",
     "files": [
         {
             "path": "background/background.js",
-            "size": 138194,
-            "sha256": "6433b41eeecf4a35e8d4ef0f61da8e874cae25357bd80bfb7245d1ac573e1b7c"
+            "size": 146235,
+            "sha256": "af4763542c642361f5775bf0f463d101bdef353010267900d5285ec9bcdd417c"
         },
         {
             "path": "bridge/cc-android-polyfill.js",
-            "size": 42600,
-            "sha256": "226007c47a1bf7467152439e152132ea412f0d45ea5c097d6abec292184c1725"
+            "size": 59439,
+            "sha256": "b10cd32b5a5f9d10135ed0ae3fa677ecfe73e0850ec42811bb5fbdd79d314c49"
         },
         {
             "path": "bridge/cc-mobile-launcher-orb.js",
-            "size": 94753,
-            "sha256": "f9a3fd4814236d1432017283316d70e60835180052fa13f111928b73fffe421d"
+            "size": 87752,
+            "sha256": "305d66464c219888a55919462fa4cfb8b700cb650b66bfc0f23896cb36c27687"
+        },
+        {
+            "path": "bridge/cc-mobile-preferences.js",
+            "size": 16495,
+            "sha256": "6f863e7dcce9d50daae967572ba15a1f64422b414f643b11f0f58a4409fadaa5"
+        },
+        {
+            "path": "bridge/cc-mobile-session.js",
+            "size": 11589,
+            "sha256": "22490f335d3c8582d8ea49c99c89cad0cbc31bfff786d3aeb0f8e07aa1dc5697"
         },
         {
             "path": "content/chesscom.js",
-            "size": 271789,
-            "sha256": "df877fdc613db9c1c2fc0da9f745d2ef7285f5f74757dd7607632ff46e1e4e09"
+            "size": 282847,
+            "sha256": "70cf060c8d9a5522c3a77d79e606661516551e24911323c2de79998d74f051f2"
         },
         {
             "path": "content/content.css",
@@ -29,8 +39,8 @@
         },
         {
             "path": "content/content.js",
-            "size": 268901,
-            "sha256": "7a403e6c0c5cfe9fab8104b5383d84537d7c41dda798aef84384730e8ac37a40"
+            "size": 291324,
+            "sha256": "6489d9e5a10754923626301a2e61135d1f7b9a221be14450d96bbb4041d0d6b1"
         },
         {
             "path": "content/privacy-mask-bootstrap.js",
@@ -64,8 +74,8 @@
         },
         {
             "path": "lib/engine-client.js",
-            "size": 38824,
-            "sha256": "34682b6b28438387e2e9886c7dc30ef05b3c2a20f6491f644439dc70a0a5b932"
+            "size": 39947,
+            "sha256": "fc8254c55cbe94a25d33de94583fabd774ff797c2873916ad03a4e6e70621379"
         },
         {
             "path": "lib/explainer.js",
@@ -114,8 +124,8 @@
         },
         {
             "path": "offscreen/offscreen.js",
-            "size": 21243,
-            "sha256": "94348eb4487ad4591980367374fd88967756127a23df46d03a9775b8e5543006"
+            "size": 22053,
+            "sha256": "89b22368f6926c5f2e8debc233449e83c6b9c9cf4f5644228381fe3073a9ed0e"
         },
         {
             "path": "pages/credits.css",

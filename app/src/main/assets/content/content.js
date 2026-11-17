@@ -96,6 +96,8 @@
 
   // Режим работы меню: "all" | "hvh" | "legit"
   let workMode = "all";
+  let mobilePreferenceUnsubscribe = null;
+  let mobilePreferenceLoad = 0;
   let activeTabId = "analyzer";
   let panelLeft = null;
   let panelTop = null;
@@ -162,7 +164,7 @@
   let phonkEditEnabled = true;
   let mateStyle = "phonk_skull";
   let roflMode = true;
-  let safeAntiBanGuard = true;
+  let safeAntiBanGuard = false;
   let welcomeBannerHidden = false;
 
   let castlingRights = { K: true, Q: true, k: true, q: true };
@@ -222,6 +224,8 @@
   let activeNativeMove = null;
   let nativeMoveFailureKey = "";
   let nativeMoveFailures = 0;
+  let nativeMoveBlockedKey = "";
+  let nativeMoveBlockedState = null;
   let moveCooldownUntil = 0;
   let currentTurnDecision = {
     boardKey: "",
@@ -247,6 +251,15 @@
   let mainIntervalId = null;
   let neuralCanvasRafId = null;
   let uiAbortController = null;
+  const mobileSession = window.__CC_ANDROID_GAME_SESSION__ || null;
+  let unregisterMobileCore = null;
+  let mobileAnalysisLease = null;
+  let mobilePollTimer = null;
+  let cycleWakeTimer = null;
+  let engineRecoveryTimer = null;
+  let boardMutationTimer = null;
+  let deferredRecalculate = false;
+  let nativeBlockEngineReleasedKey = "";
 
   const StockfishWasmEngine = window.ChessCoachEngine.create({
     isEnabled: () => useStockfishWasm && !extensionInvalidated && isContextValid()
@@ -261,6 +274,7 @@
   }
 
   function handleEngineVisibilityChange(event) {
+    if (mobileSession) return;
     cancelNativeMove("visibility");
     clearAnalysisRetry();
     analysisRequestId++;
@@ -281,6 +295,11 @@
     extensionInvalidated = true;
     cancelNativeMove("shutdown");
     clearAnalysisRetry();
+    if (unregisterMobileCore) { unregisterMobileCore(); unregisterMobileCore = null; }
+    clearTimeout(mobilePollTimer);
+    clearTimeout(cycleWakeTimer);
+    clearTimeout(engineRecoveryTimer);
+    clearTimeout(boardMutationTimer);
     try { StockfishWasmEngine.terminate(); } catch (e) {}
     if (mainIntervalId) { clearInterval(mainIntervalId); mainIntervalId = null; }
     if (neuralCanvasRafId) { cancelAnimationFrame(neuralCanvasRafId); neuralCanvasRafId = null; }
@@ -307,6 +326,7 @@
     window.removeEventListener("cc-mobile-lifecycle", handleMobileMoveLifecycle);
     try {
       if (domObserver) domObserver.disconnect();
+      if (boardDiscoveryObserver) boardDiscoveryObserver.disconnect();
     } catch (e) {}
     if (shadowRoot?.host?.isConnected) shadowRoot.host.remove();
     shadowRoot = null;
@@ -317,9 +337,43 @@
 
   contentInstanceHandle = Object.freeze({
     isAlive: () => !extensionInvalidated && isContextValid(),
+    revive: () => mobileSession?.revive(),
     shutdown: () => shutdownOrphanedScript()
   });
   Object.defineProperty(window, CONTENT_INSTANCE_KEY, { value: contentInstanceHandle, configurable: true });
+
+  function isOrphanedContextError(error) {
+    if (!isContextValid() || window.__CC_ANDROID_RUNTIME__?.disposed) return true;
+    const code = String(error?.code || "");
+    const message = String(error?.message || error || "");
+    return code === "CONTEXT_INVALIDATED" || /(?:extension context invalidated|android runtime is disposed)/i.test(message);
+  }
+
+  function handleMessageCallbackFailure(error) {
+    console.error("[ChessCoach] Lichess response callback failed:", error);
+    if (isOrphanedContextError(error)) {
+      shutdownOrphanedScript();
+      return;
+    }
+    mobileSession?.reportError(error);
+    if (mobileAnalysisLease) {
+      mobileSession?.finishAnalysis(mobileAnalysisLease, "failed");
+      mobileAnalysisLease = null;
+      activeEngineBoardKey = "";
+      committedBoardKey = "";
+    }
+    setAutoStatusText(`Ошибка Lichess: ${String(error?.message || error || "неизвестная ошибка").slice(0, 120)}`, "#ffbe0b");
+  }
+
+  function invokeMessageCallback(callback, value) {
+    if (typeof callback !== "function") return;
+    try {
+      const result = callback(value);
+      if (result && typeof result.then === "function") result.catch(handleMessageCallbackFailure);
+    } catch (error) {
+      handleMessageCallbackFailure(error);
+    }
+  }
 
   function safeSendMessage(payload, callback) {
     if (extensionInvalidated || !isContextValid()) {
@@ -330,16 +384,17 @@
       chrome.runtime.sendMessage(payload, (res) => {
         try {
           if (chrome.runtime.lastError) {
-            if (callback) callback({ error: chrome.runtime.lastError.message, status: "error", meta: payload.meta || null });
+            invokeMessageCallback(callback, { error: chrome.runtime.lastError.message, status: "error", meta: payload.meta || null });
             return;
           }
-          if (callback) callback(res);
+          invokeMessageCallback(callback, res);
         } catch (err) {
-          shutdownOrphanedScript();
+          handleMessageCallbackFailure(err);
         }
       });
     } catch (err) {
-      if (callback) callback({ error: String(err?.message || err), status: "error", meta: payload.meta || null });
+      if (isOrphanedContextError(err)) shutdownOrphanedScript();
+      else invokeMessageCallback(callback, { error: String(err?.message || err), status: "error", meta: payload.meta || null });
     }
   }
 
@@ -367,8 +422,15 @@
     return getShadow().getElementById(id);
   }
 
-  function saveSetting(obj) {
+  function saveSetting(obj, recalculate = false) {
     if (extensionInvalidated || !isContextValid()) return;
+    const preferences = window.__CC_MOBILE_PREFERENCES__;
+    if (preferences) {
+      const write = preferences.update("lichess", obj, { source: "core", recalculate });
+      write.catch(error => console.warn("[ChessCoach] Settings were not saved:", error?.message || error));
+      return write;
+    }
+    if (window.__CC_ANDROID_RUNTIME__) return;
     try {
       if (chrome.storage && chrome.storage.local) {
         const scoped = Object.fromEntries(Object.entries(obj || {}).map(([key, value]) => [storageKey(key), value]));
@@ -471,6 +533,12 @@
   }
 
   function applyWorkModePreset(mode, triggerSave = true) {
+    if (window.__CC_MOBILE_PREFERENCES__) {
+      if (!["all", "hvh", "legit"].includes(mode)) return;
+      if (triggerSave) saveSetting({ workMode: mode });
+      else { workMode = mode; updateUIValues(); }
+      return;
+    }
     workMode = mode;
     const panel = $("chesscoach-panel");
     if (panel) {
@@ -702,11 +770,31 @@
     neuralCanvasRafId = requestAnimationFrame(renderFrame);
   }
 
-  function loadSettings() {
+  function loadSettings(resolvedSettings = null, triggerRecalculate = true) {
     if (!isContextValid()) return;
+    const preferences = window.__CC_MOBILE_PREFERENCES__;
+    if (preferences && resolvedSettings === null) {
+      const generation = ++mobilePreferenceLoad;
+      mobilePreferenceUnsubscribe?.();
+      mobilePreferenceUnsubscribe = null;
+      return preferences.ready.then(() => {
+        if (extensionInvalidated || generation !== mobilePreferenceLoad) return;
+        loadSettings(preferences.get("lichess"));
+        mobilePreferenceUnsubscribe = preferences.subscribe("lichess", (settings, meta) => {
+          if (!extensionInvalidated) loadSettings(settings, meta.recalculate === true);
+        });
+      }).catch(error => {
+        console.warn("[ChessCoach] Settings were not restored:", error?.message || error);
+        throw error;
+      });
+    }
+    if (window.__CC_ANDROID_RUNTIME__ && !preferences) return;
     try {
       if (chrome.storage && chrome.storage.local) {
-        chrome.storage.local.get(
+        const readSettings = preferences
+          ? (_keys, callback) => callback(Object.fromEntries(Object.entries(resolvedSettings).map(([key, value]) => [storageKey(key), value])))
+          : (keys, callback) => chrome.storage.local.get(keys, callback);
+        readSettings(
           [...SETTINGS_KEYS, ...SETTINGS_KEYS.map(storageKey)],
           (res) => {
             if (!isContextValid() || !res) return;
@@ -785,8 +873,8 @@
             if (res.premoveOpeningMode !== undefined) premoveOpeningMode = res.premoveOpeningMode;
             if (typeof res.showPremoveArrows === "boolean") showPremoveArrows = res.showPremoveArrows;
 
-            if (workMode === "hvh" && typeof res.engineMaxMode !== "boolean") engineMaxMode = true;
-            if (engineMaxMode) {
+            if (!preferences && workMode === "hvh" && typeof res.engineMaxMode !== "boolean") engineMaxMode = true;
+            if (!preferences && engineMaxMode) {
               useStockfishWasm = true;
               currentElo = 3000;
               currentStyle = "balanced";
@@ -804,7 +892,7 @@
             applyPersistentPanelGeometry();
             switchTab(activeTabId, false);
             updateUIValues();
-            forceRecalculate();
+            if (triggerRecalculate) forceRecalculate();
           }
         );
       }
@@ -1029,6 +1117,61 @@
     });
   }
 
+  function getMobileAnalysisConfig() {
+    const effective = mobileSession?.effective();
+    return JSON.stringify([currentElo, currentStyle, useStockfishWasm, engineMaxMode, turnMode, forcedMyColor,
+      showAverageMove, showWorstMove, useAverageMoveSometimes, trapRadarEnabled, workMode,
+      Boolean(effective?.lowTier), Boolean(effective?.bulletTurboMode), Boolean(effective?.premoveEnabled)]);
+  }
+
+  function finishCurrentAnalysis(requestId, phase = "complete") {
+    if (requestId !== analysisRequestId) return;
+    activeEngineBoardKey = "";
+    if (mobileAnalysisLease) mobileSession?.finishAnalysis(mobileAnalysisLease, phase);
+  }
+
+  function scheduleEngineRecovery(state) {
+    if (!mobileSession || engineRecoveryTimer || document.hidden || !useStockfishWasm) return;
+    const configKey = getMobileAnalysisConfig();
+    engineRecoveryTimer = setTimeout(async () => {
+      engineRecoveryTimer = null;
+      if (extensionInvalidated || document.hidden || currentPositionKey !== state.positionKey || getMobileAnalysisConfig() !== configKey) return;
+      const ready = await StockfishWasmEngine.initWorker();
+      if (extensionInvalidated || document.hidden || currentPositionKey !== state.positionKey || getMobileAnalysisConfig() !== configKey) return;
+      if (!ready) { scheduleEngineRecovery(state); return; }
+      mobileSession.retryAnalysis();
+      analysisRetryCount = finalEngineRetryCount = 0;
+      committedBoardKey = "";
+      runCycle(false);
+    }, 20000);
+  }
+
+  function suspendMobileCore(reason, releaseSearch) {
+    resetTurnDecision();
+    cancelNativeMove(reason);
+    clearTimeout(cycleWakeTimer);
+    clearTimeout(mobilePollTimer);
+    clearTimeout(engineRecoveryTimer);
+    clearTimeout(boardMutationTimer);
+    boardMutationTimer = null;
+    engineRecoveryTimer = null;
+    cycleWakeTimer = mobilePollTimer = null;
+    if (releaseSearch || reason === "settings") {
+      if (reason === "settings" && !releaseSearch) {
+        analysisRequestId++;
+        positionAnalysisId++;
+        activeEngineBoardKey = "";
+        mobileAnalysisLease = null;
+      }
+      clearAnalysisRetry();
+      committedBoardKey = committedEnemyBoardKey = "";
+      mobileSession?.retryAnalysis();
+      StockfishWasmEngine.terminate();
+    }
+    if (reason !== "settings") hideArrows();
+    try { window.ChessFX?.stopPhonkEdit?.(shadowRoot); } catch (e) {}
+  }
+
   let lastStatusString = "";
   function setAutoStatusText(text, color = "#00f5d4") {
     if (text === lastStatusString) return;
@@ -1050,14 +1193,38 @@
   function cancelNativeMove(reason) {
     if (!activeNativeMove) return;
     const action = activeNativeMove;
+    action.cancelReason = reason;
+    if (action.gestureSent) {
+      nativeMoveBlockedKey = action.failureKey;
+      nativeMoveBlockedState = action.inputState;
+    }
     action.controller.abort();
-    if (action.failureKey === nativeMoveFailureKey && action.attempt === nativeMoveFailures) nativeMoveFailures = Math.max(0, nativeMoveFailures - 1);
-    try { window.__CC_ANDROID_RUNTIME__?.nativeRequest("input.cancel", {}).catch(() => {}); } catch (e) {}
-    activeNativeMove = null;
-    setMoveExecutionState(false, reason);
+  }
+
+  function isNativeAutoBlocked(state) {
+    const blocked = nativeMoveBlockedState;
+    if (!blocked) return false;
+    const ply = getLichessRoundPly(state.boardElement);
+    const changedGame = blocked.url !== location.href || blocked.board !== state.boardElement || blocked.myColor !== state.myColor;
+    const realProgress = Number.isInteger(blocked.ply) && Number.isInteger(ply) && ply !== blocked.ply;
+    const realReply = blocked.lastEnemy !== lastRealEnemyMove || (blocked.sawOpponent && state.actualTurn === state.myColor && state.positionKey !== blocked.positionKey);
+    if (changedGame || realProgress || realReply) {
+      nativeMoveBlockedState = null;
+      nativeMoveBlockedKey = "";
+      nativeBlockEngineReleasedKey = "";
+      nativeMoveFailureKey = "";
+      nativeMoveFailures = 0;
+      if (deferredRecalculate && window.__CC_ANDROID_SETTINGS_OPEN__ !== true) {
+        setTimeout(flushDeferredRecalculate, 0);
+      }
+      return false;
+    }
+    if (state.actualTurn !== state.myColor) blocked.sawOpponent = true;
+    return true;
   }
 
   function handleMobileMoveLifecycle(event) {
+    if (mobileSession) return;
     const detail = event?.detail;
     if (detail?.cancelPendingMoves === true || detail?.state === "settings") {
       resetTurnDecision();
@@ -1085,6 +1252,7 @@
           positionId !== retry.positionId || currentPositionKey !== retry.positionKey) return;
       // Only the owned retry timer may unlock this position; polling must not consume retries.
       committedBoardKey = "";
+      mobileSession?.retryAnalysis();
       runCycle(false);
     }, delayMs);
   }
@@ -1151,6 +1319,7 @@
     hideArrows();
     // Style/clock mutations require recapturing, not another engine search.
     if (reason !== "BOARD_REPLACED" && reason !== "NO_BOARD") return;
+    mobileSession?.invalidate(reason);
     clearAnalysisRetry();
     positionAnalysisId++;
     analysisRequestId++;
@@ -1196,17 +1365,21 @@
       positionKey: state.positionKey,
       analysisKey: state.boardKey,
       elo: currentElo,
-      engineMaxMode
+      engineMaxMode,
+      ...(mobileSession ? { mobileEpoch: mobileSession.epoch, configKey: getMobileAnalysisConfig(),
+        needPremove: Boolean(mobileSession.effective().premoveEnabled || mobileSession.effective().bulletTurboMode) } : {})
     };
   }
 
   function isCurrentAnalysisMeta(meta) {
+    if (mobileSession && (!mobileSession.isReady || meta?.mobileEpoch !== mobileSession.epoch)) return false;
     if (boardDirty && meta?.sessionId === analysisSessionId && meta.positionId === positionId && meta.analysisId === positionAnalysisId) {
       const fresh = captureBoardState(true);
       if (!fresh || fresh.animating) {
         // A discarded animation-time response must not strand an empty committed cache.
         committedBoardKey = "";
         activeEngineBoardKey = "";
+        mobileSession?.retryAnalysis();
         return false;
       }
       adoptPositionState(fresh);
@@ -1221,6 +1394,16 @@
   }
 
   function forceRecalculate() {
+    if (mobileSession && (window.__CC_ANDROID_SETTINGS_OPEN__ === true || nativeMoveBlockedState)) {
+      deferredRecalculate = true;
+      return;
+    }
+    deferredRecalculate = false;
+    if (mobileSession?.hasAnalysis(currentPositionKey, getMobileAnalysisConfig()) && mobileSession.snapshot().analysis !== "failed") {
+      scheduleAutoMoveIfNeeded();
+      return;
+    }
+    if (mobileSession?.snapshot().analysis === "failed") mobileSession.retryAnalysis();
     cancelNativeMove("recalculate");
     clearAnalysisRetry();
     committedBoardKey = "";
@@ -1231,6 +1414,24 @@
     positionAnalysisId++;
     resetTurnDecision();
     runCycle(true);
+  }
+
+  function flushDeferredRecalculate() {
+    if (!deferredRecalculate || window.__CC_ANDROID_SETTINGS_OPEN__ === true || nativeMoveBlockedState) return false;
+    forceRecalculate();
+    return true;
+  }
+
+  function releaseEngineForNativeBlock() {
+    if (!mobileSession || !nativeMoveBlockedKey || nativeBlockEngineReleasedKey === nativeMoveBlockedKey) return;
+    nativeBlockEngineReleasedKey = nativeMoveBlockedKey;
+    clearAnalysisRetry();
+    analysisRequestId++;
+    activeEngineBoardKey = "";
+    committedBoardKey = committedEnemyBoardKey = "";
+    mobileAnalysisLease = null;
+    mobileSession.retryAnalysis();
+    StockfishWasmEngine.terminate();
   }
 
   function switchTab(tabId, saveToStorage = true) {
@@ -2270,6 +2471,14 @@
     });
 
     const toggleAutoMoveMaster = (newState) => {
+      if (window.__CC_MOBILE_PREFERENCES__) {
+        if (newState) { nativeMoveFailureKey = ""; nativeMoveFailures = 0; }
+        else cancelNativeMove("automation-disabled");
+        resetTurnDecision();
+        saveSetting({ autoMoveEnabled: newState }, newState);
+        setAutoStatusText(newState ? "Автоход включён" : "Автоход выключен", newState ? "#00f5d4" : "#94a3b8");
+        return;
+      }
       autoMoveEnabled = newState;
       if (newState) { nativeMoveFailureKey = ""; nativeMoveFailures = 0; }
       if (!newState) {
@@ -2291,6 +2500,15 @@
     $("cc-auto-master-chk").addEventListener("change", (e) => toggleAutoMoveMaster(e.target.checked));
 
     $("cc-bullet-turbo-chk").addEventListener("change", (e) => {
+      if (window.__CC_MOBILE_PREFERENCES__) {
+        const enabled = e.target.checked;
+        resetTurnDecision();
+        saveSetting({ bulletTurboMode: enabled, ...(enabled ? {
+          autoMoveEnabled: true, premoveEnabled: true, showPremoveArrows: true, premoveRiskLevel: 3
+        } : {}) }, true);
+        setAutoStatusText(enabled ? "Режим резни 1+0 включён" : "Режим резни 1+0 выключен", enabled ? "#ff4d94" : "#00f5d4");
+        return;
+      }
       bulletTurboMode = e.target.checked;
       if (bulletTurboMode) {
         autoMoveEnabled = true;
@@ -2338,6 +2556,11 @@
     });
 
     $("cc-premove-chk").addEventListener("change", (e) => {
+      if (window.__CC_MOBILE_PREFERENCES__) {
+        if (!e.target.checked) preparedLookahead = null;
+        saveSetting({ premoveEnabled: e.target.checked, ...(e.target.checked ? { showPremoveArrows: true } : {}) }, true);
+        return;
+      }
       premoveEnabled = e.target.checked;
       if (premoveEnabled) {
         showPremoveArrows = true;
@@ -2411,6 +2634,11 @@
     });
 
     $("cc-sf-wasm-chk").addEventListener("change", (e) => {
+      if (window.__CC_MOBILE_PREFERENCES__) {
+        if (e.target.checked) StockfishWasmEngine.initWorker(); else StockfishWasmEngine.terminate();
+        saveSetting({ useStockfishWasm: e.target.checked }, true);
+        return;
+      }
       useStockfishWasm = e.target.checked;
       if (useStockfishWasm) StockfishWasmEngine.initWorker();
       else StockfishWasmEngine.terminate();
@@ -2419,6 +2647,11 @@
       forceRecalculate();
     });
     $("cc-engine-max-chk").addEventListener("change", (e) => {
+      if (window.__CC_MOBILE_PREFERENCES__) {
+        saveSetting({ engineMaxMode: e.target.checked }, true);
+        setAutoStatusText(e.target.checked ? "ENGINE MAX включён" : "ENGINE MAX выключен", "#64cdb9");
+        return;
+      }
       engineMaxMode = e.target.checked;
       if (engineMaxMode) {
         currentElo = 3000;
@@ -3309,6 +3542,7 @@
 
   function scheduleAutoMoveIfNeeded() {
     if (!autoMoveEnabled || extensionInvalidated || document.hidden) return;
+    if (mobileSession && !mobileSession.effective().autoMoveEnabled) return;
     if (window.__CC_ANDROID_SETTINGS_OPEN__ === true) {
       setAutoStatusText("Автоход на паузе: открыты настройки", "#ffbe0b");
       return;
@@ -3445,6 +3679,7 @@
   }
 
   function executeVisualPremoveOnBoard(premoveObj, state) {
+    if (mobileSession && !(mobileSession.effective().premoveEnabled || mobileSession.effective().bulletTurboMode)) return;
     if (!premoveObj || !/^[a-h][1-8]$/.test(premoveObj.from || "") || !/^[a-h][1-8]$/.test(premoveObj.to || "") ||
         premoveObj.from === premoveObj.to || !state || !state.grid || document.hidden || window.__CC_ANDROID_SETTINGS_OPEN__ === true) return;
     if (safeAntiBanGuard && isRatedGameAgainstHuman()) {
@@ -3567,14 +3802,18 @@
   async function executeAndroidMoveOnBoard(moveObj, state, manualClick, promoPiece, isPremove = false) {
     if (isExecutingMove || document.hidden || extensionInvalidated || (!manualClick && window.__CC_ANDROID_SETTINGS_OPEN__ === true)) return;
     const runtime = window.__CC_ANDROID_RUNTIME__;
+    if (!mobileSession?.isReady) { setAutoStatusText("Input snapshot is not ready", "#ffbe0b"); return; }
     const failureKey = `${location.href}|${state.positionId}|${state.positionKey}|${isPremove ? "premove" : "move"}`;
+    if (!manualClick && (isNativeAutoBlocked(state) || nativeMoveBlockedKey === failureKey)) return;
     if (nativeMoveFailureKey !== failureKey) { nativeMoveFailureKey = failureKey; nativeMoveFailures = 0; }
     if (!manualClick && nativeMoveFailures >= 3) {
       setAutoStatusText("Нативный ввод не подтверждён после 3 попыток. Сходите вручную.", "#ffbe0b");
       return;
     }
     const attempt = ++nativeMoveFailures;
-    const action = { controller: new AbortController(), failureKey, attempt };
+    const action = { controller: new AbortController(), failureKey, attempt,
+      inputState: { url: location.href, board: state.boardElement, positionKey: state.positionKey,
+        myColor: state.myColor, ply: getLichessRoundPly(state.boardElement), lastEnemy: lastRealEnemyMove, sawOpponent: false } };
     activeNativeMove = action;
     const pageUrl = location.href;
     const previousMove = lastOurExecutedMove;
@@ -3598,7 +3837,7 @@
       if (activeNativeMove !== action || action.controller.signal.aborted || extensionInvalidated || document.hidden ||
           location.href !== pageUrl || !boardEl?.isConnected || runtime.disposed ||
           (!manualClick && window.__CC_ANDROID_SETTINGS_OPEN__ === true) ||
-          (!manualClick && !(isPremove ? premoveEnabled || bulletTurboMode : autoMoveEnabled))) throw new Error("Контекст хода изменился");
+           (!manualClick && !(isPremove ? mobileSession.effective().premoveEnabled || mobileSession.effective().bulletTurboMode : mobileSession.effective().autoMoveEnabled))) throw new Error("Контекст хода изменился");
       if ((document.querySelector(".main-board cg-board") || document.querySelector("cg-board")) !== boardEl) throw new Error("Доска была заменена");
       if (!manualClick && safeAntiBanGuard && isRatedGameAgainstHuman()) throw new Error("Рейтинговая партия против человека: автоход заблокирован");
     };
@@ -3621,17 +3860,23 @@
       const row = state.isBlackOrientation ? rank : 7 - rank;
       return { x: rect.left + (col + 0.5) * rect.width / 8, y: rect.top + (row + 0.5) * rect.height / 8 };
     };
-    const sendGesture = async (actionType, points, target = boardEl) => {
+    const inputPreflightError = (code, message, phase) => Object.assign(new Error(message), { code, phase });
+    const sendGesture = async (actionType, points, target = boardEl, phase = `${actionType}-preflight`) => {
       requireVisibleContext();
-      for (const point of points) {
-        const hit = document.elementFromPoint(point.x, point.y);
-        if (!hit || (hit !== target && !target.contains(hit))) throw new Error("Доска перекрыта меню или другим элементом");
-      }
-      const result = await runtime.nativeRequest("input.gesture", { action: actionType, points, durationMs: actionType === "tap" ? 80 : 180 });
+      const targetId = mobileSession.registerTarget(target);
+      const snapshot = runtime.captureInputSnapshot({ points, targetId });
+      if (!snapshot) throw inputPreflightError("INPUT_SNAPSHOT_UNAVAILABLE", "Input snapshot is unavailable", phase);
+      if (!snapshot.hit) throw inputPreflightError("INPUT_TARGET_BLOCKED", "Input target is obscured", phase);
+      if (snapshot.animating) throw inputPreflightError("INPUT_POSITION_ANIMATING", "Board redraw is still active", phase);
+      action.gestureSent = true;
+      const result = await runtime.nativeRequest("input.gesture", {
+        action: actionType, points, durationMs: actionType === "tap" ? 80 : 180, targetId, snapshot
+      }, { signal: action.controller.signal });
       if (result?.ok !== true || result?.dispatched !== true) throw new Error("Android не подтвердил отправку касания");
     };
     const moveConfirmed = fresh => Boolean(fresh && fresh.boardKey !== state.boardKey &&
       fresh.grid?.[fromRow]?.[fromCol] !== movingPiece && fresh.grid?.[toRow]?.[toCol] === expectedPiece);
+    const confirmationError = (code, message) => Object.assign(new Error(message), { code });
     setMoveExecutionState(true, isPremove ? "premove-start" : "move-start");
     setAutoStatusText(`Нативный ввод: ${moveObj.from} -> ${moveObj.to}...`, "#00f5d4");
     try {
@@ -3641,21 +3886,20 @@
       await Promise.race([layout, wait(400).then(() => { throw new Error("Меню не успело освободить доску"); })]);
       boardEl = document.querySelector(".main-board cg-board") || document.querySelector("cg-board");
       requireCurrentPosition();
-      const selected = boardEl.querySelector("square.selected:not(.current-premove)");
-      if (selected) {
-        const rect = selected.getBoundingClientRect();
-        await sendGesture("tap", [{ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }]);
-        requireCurrentPosition();
+      const round = boardEl.closest("main.round .round__app");
+      const startPly = getLichessRoundPly(boardEl);
+      const moveQuestion = () => {
+        const label = window.i18n?.site?.confirmMove;
+        const question = round?.querySelector(".rcontrols .question");
+        return typeof label === "string" && question?.querySelector("p")?.textContent.trim() === label.trim() ? question : null;
+      };
+      if (!isPremove && moveQuestion()) {
+        throw confirmationError("MOVE_CONFIRMATION_PENDING", "A previously staged move is awaiting confirmation");
       }
       const p1 = pointFor(moveObj.from);
       const p2 = pointFor(moveObj.to);
-      if (isPremove || autoClickMethod === "drag" || attempt > 1) {
-        await sendGesture("drag", [p1, { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 }, p2]);
-      } else {
-        await sendGesture("tap", [p1]);
-        requireCurrentPosition();
-        await sendGesture("tap", [pointFor(moveObj.to)]);
-      }
+      // One Android gesture avoids Chessground's deferred `piece.dragging` cleanup between two taps.
+      await sendGesture("drag", [p1, { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 }, p2], boardEl, isPremove ? "premove-preflight" : "move-preflight");
       if (promoPiece) {
         const chooserDeadline = Date.now() + 900;
         while (Date.now() < chooserDeadline) {
@@ -3678,16 +3922,54 @@
         }
       }
       const deadline = Date.now() + 1500;
+      let confirmationTapped = false;
+      let stagedMoveSeen = false;
       while (Date.now() < deadline) {
         requireVisibleContext();
         const fresh = captureBoardState(true);
+        const displayed = moveConfirmed(fresh);
+        const question = !isPremove && moveQuestion();
+        const serverPly = getLichessRoundPly(boardEl);
+        if (question && !confirmationTapped) {
+          const staged = fresh && detectRealMoveBetweenGrids(state.grid, fresh.grid);
+          if (!displayed || staged?.uci !== `${moveObj.from}${moveObj.to}${promoPiece || ""}` || staged.color !== state.myColor ||
+              fresh.myColor !== state.myColor || fresh.isBlackOrientation !== state.isBlackOrientation ||
+              (startPly !== null && serverPly !== startPly)) {
+            throw confirmationError("MOVE_CONFIRMATION_CHANGED", "The pending confirmation does not belong to the requested move");
+          }
+          const button = question.querySelector("a.yes");
+          const rect = button?.getBoundingClientRect();
+          let visible = Boolean(button);
+          for (let node = button; node && node !== round.parentElement; node = node.parentElement) {
+            const style = getComputedStyle(node);
+            if (style.display === "none" || style.visibility !== "visible" || style.opacity === "0") { visible = false; break; }
+          }
+          if (!question.isConnected || !button?.isConnected || !round.contains(button) || button.matches(":disabled, [aria-disabled='true']") ||
+              button.closest("[hidden], [aria-hidden='true']") || !rect || rect.width <= 0 || rect.height <= 0 ||
+              !visible) {
+            throw confirmationError("MOVE_CONFIRMATION_UNAVAILABLE", "The move confirmation control is not visible and enabled");
+          }
+          // Round questions also accept draws/takebacks. Only this move's localized prompt may be tapped, once.
+          confirmationTapped = true;
+          stagedMoveSeen = true;
+          await sendGesture("tap", [{ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }], button);
+          continue;
+        }
+        if (displayed) stagedMoveSeen = true;
+        const opponentClock = state.myColor === (state.isBlackOrientation ? "b" : "w") ? "top" : "bottom";
+        const submitted = startPly !== null ? serverPly !== null && serverPly > startPly :
+          !confirmationTapped || Boolean(round?.querySelector(`.rclock-${opponentClock}.running, .rclock-${opponentClock}.rclock-turn .rclock-turn__text`));
+        const acceptedMove = displayed || (confirmationTapped && stagedMoveSeen && startPly !== null && serverPly > startPly + 1);
         if (isPremove ? fresh?.positionKey === state.positionKey && boardEl.querySelector("square.current-premove") :
-            moveConfirmed(fresh) && !boardEl.querySelector("piece.anim, piece.dragging")) {
+            !question && acceptedMove && submitted && !boardEl.querySelector("piece.anim, piece.dragging")) {
           completed = true;
           break;
         }
         if (isPremove && fresh?.positionKey !== state.positionKey) throw new Error("Позиция изменилась до подтверждения премува");
         await wait(75);
+      }
+      if (!completed && confirmationTapped) {
+        throw confirmationError("MOVE_CONFIRMATION_TIMEOUT", "The confirmation tap was sent, but the move was not submitted");
       }
       if (!completed) throw new Error(promoPiece ? "Превращение не подтверждено на доске" : "Касания отправлены, но ход на доске не подтверждён");
       if (!isPremove) {
@@ -3697,6 +3979,12 @@
       setAutoStatusText(`${isPremove ? "Премув установлен" : "Ход подтверждён"}: ${moveObj.from} -> ${moveObj.to}`, "#00f5d4");
     } catch (error) {
       if (activeNativeMove === action) {
+        if (action.gestureSent) {
+          nativeMoveBlockedKey = failureKey;
+          nativeMoveBlockedState = action.inputState;
+          releaseEngineForNativeBlock();
+        }
+        mobileSession.reportError(error);
         lastOurExecutedMove = previousMove;
         setAutoStatusText(`Нативный ввод: ${error.message || "ошибка"}${error.code ? ` [${error.code}]` : ""}`, "#ffbe0b");
       }
@@ -3705,8 +3993,9 @@
       action.controller.abort();
       if (activeNativeMove === action) {
         activeNativeMove = null;
+        if (completed) { nativeMoveBlockedKey = ""; nativeMoveBlockedState = null; }
         moveCooldownUntil = Date.now() + (completed ? 180 : 350);
-        setMoveExecutionState(false, completed ? "confirmed" : "failed");
+        setMoveExecutionState(false, completed ? "confirmed" : action.cancelReason || "failed");
         triggerDebouncedCycle();
       }
     }
@@ -3926,6 +4215,14 @@
     const myColor = isBlackOrientation ? "b" : "w";
     const enemyColor = myColor === "w" ? "b" : "w";
 
+    if (boardPart === "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR") return "w";
+    const roundPly = getLichessRoundPly(cgBoard);
+    if (roundPly !== null) return roundPly % 2 === 0 ? "w" : "b";
+    const round = cgBoard.closest("main.round .round__app");
+    const bottomClock = round?.querySelector(".rclock-bottom.running, .rclock-bottom.rclock-turn .rclock-turn__text");
+    const topClock = round?.querySelector(".rclock-top.running, .rclock-top.rclock-turn .rclock-turn__text");
+    if (Boolean(bottomClock) !== Boolean(topClock)) return bottomClock ? myColor : enemyColor;
+
     const cellW = boardRect.width / 8;
     const cellH = boardRect.height / 8;
     const lastMoveSquares = cgBoard.querySelectorAll("square.last-move");
@@ -3950,20 +4247,40 @@
       }
     }
 
-    if (boardPart === "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR") {
-      return "w";
-    }
-
-    if (document.querySelector(".rclock-bottom.rclock-turn, .rclock-bottom.running")) return myColor;
-    if (document.querySelector(".rclock-top.rclock-turn, .rclock-top.running")) return enemyColor;
-
     const observedPly = getObservedPlyIndex();
     if (observedPly !== null) return observedPly % 2 === 0 ? "w" : "b";
 
     return "w";
   }
 
+  function getLichessRoundPly(cgBoard) {
+    const round = cgBoard?.closest("main.round .round__app");
+    if (!round) return null;
+    const plyOf = button => {
+      const value = button?.getAttribute("data-ply");
+      return /^-?\d+$/.test(value || "") && Number.isSafeInteger(Number(value)) ? Number(value) : null;
+    };
+    // Replay controls use ctrl.ply, unlike the move list, which includes an optimistic pendingStep.
+    const mobile = Array.from(round.querySelectorAll(".col1-moves > button.fbt[data-ply]"));
+    if (mobile.length === 2) {
+      const previous = plyOf(mobile[0]);
+      const next = plyOf(mobile[1]);
+      if (previous !== null && next === previous + 2 && previous >= -1) return previous + 1;
+    }
+    const replay = Array.from(round.querySelectorAll("button.fbt.repeatable[data-ply]"));
+    if (replay.length === 4) {
+      const previous = plyOf(replay[1]);
+      const next = plyOf(replay[2]);
+      if (!replay[1].disabled && previous !== null && previous >= 0) return previous + 1;
+      if (!replay[2].disabled && next !== null && next >= 1) return next - 1;
+      if (gameStartedFromInitial && uciHistoryList.length === 0 && replay.every(button => button.disabled && button.getAttribute("data-ply") === "-")) return 0;
+    }
+    return null;
+  }
+
   function getObservedPlyIndex() {
+    const roundPly = getLichessRoundPly(document.querySelector(".main-board cg-board") || document.querySelector("cg-board"));
+    if (roundPly !== null) return roundPly;
     const moveNodes = Array.from(document.querySelectorAll("l4x > kwdb, rm6 > kwdb, .tview2 > move")).filter(
       (el) => !el.closest("interrupt")
     );
@@ -4177,6 +4494,9 @@
       }
     }
 
+    const roundPly = getLichessRoundPly(document.querySelector(".main-board cg-board") || document.querySelector("cg-board"));
+    if (diffCount > 0 && roundPly !== null && roundPly === lastObservedPly) return;
+
     const observedHistoryJump = diffCount > 0 && Number.isInteger(lastObservedPly) && Number.isInteger(observedPly) && (
       observedPly < lastObservedPly || observedPly > lastObservedPly + 1
     );
@@ -4348,6 +4668,7 @@
       positionKey: `${boardPart} ${actualTurn} ${castlingStr} ${currentEpSquare}`,
       sessionId: analysisSessionId,
       positionId,
+      boardElement: cgBoard,
       boardRect,
       isBlackOrientation,
       myColor,
@@ -4449,6 +4770,7 @@
   }
 
   function renderPremovePreviewOverlay(state, premovePlan) {
+    mobileSession?.applyVisualPolicy(getShadow());
     let svg = $("chesscoach-screen-svg");
     if (!svg) {
       svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -4549,6 +4871,7 @@
   }
 
   function renderArrowsOverlay(state, res) {
+    mobileSession?.applyVisualPolicy(getShadow());
     const tokenMismatch = currentPositionKey && (boardDirty || (res.positionId !== undefined && res.positionId !== positionId) || state?.positionKey !== currentPositionKey);
     if (!state || !res || tokenMismatch) {
       hideArrows();
@@ -5358,7 +5681,7 @@
       recordEvalPoint(state.boardKey, res.best.whitePerspectiveEval ?? res.best.evalPawns, res.opponentEvalDropPawns);
     }
 
-    if (audioRadarEnabled && window.ChessFX && state.actualTurn === state.myColor) {
+    if (audioRadarEnabled && (!mobileSession || mobileSession.effective().audioRadarEnabled) && window.ChessFX && state.actualTurn === state.myColor) {
       const dropVal = parseFloat(res.opponentEvalDropPawns) || 0;
       if (res.best && (res.best.isMateInOne || res.best.isForcedMateInTwo || res.best.isCheckmate)) {
         window.ChessFX.playTacticalAudioPing("mate_lock", state.boardKey);
@@ -5459,7 +5782,7 @@
         $("cc-best-title").innerHTML = `✦ ЛУЧШИЙ ХОД • ${styleLabel}${badgesHtml}`;
       }
 
-      if (!bulletTurboMode && (isDeepPass || res.best.isMateInOne) && isBrilliant && phonkEditEnabled && state.actualTurn === state.myColor && window.ChessFX) {
+      if (!bulletTurboMode && (isDeepPass || res.best.isMateInOne) && isBrilliant && phonkEditEnabled && (!mobileSession || mobileSession.effective().mobileVisualEffects) && state.actualTurn === state.myColor && window.ChessFX) {
         window.ChessFX.triggerBrilliantPhonkEdit(getShadow(), res.best, state, 15000, false);
       }
 
@@ -5579,6 +5902,7 @@
   }
 
   function applyPremovePlanOnEnemyTurn(state, plan, allowExecution = true) {
+    if (mobileSession && !(mobileSession.effective().premoveEnabled || mobileSession.effective().bulletTurboMode || mobileSession.effective().showPremoveArrows)) return;
     if (plan && plan.telemetry) {
       lastTelemetryData = plan.telemetry;
     }
@@ -5650,6 +5974,7 @@
   }
 
   function maybePonderPredictedReply(state, plan) {
+    if (mobileSession) return;
     const predictedUci = plan?.predictedEnemyMove?.uci;
     const resources = StockfishWasmEngine.getResourceProfile?.();
     if (!engineMaxMode || !useStockfishWasm || !resources?.fullNnue || !/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(predictedUci || "")) return;
@@ -5687,6 +6012,18 @@
 
     hideArrows();
 
+    const effectivePremove = mobileSession?.effective();
+    if (mobileSession && !(effectivePremove.premoveEnabled || effectivePremove.bulletTurboMode || effectivePremove.showPremoveArrows)) {
+      if (isAltPressed || effectivePremove.heatmapAlwaysOn) {
+        safeSendMessage({ type: "GET_BOARD_HEATMAP", fen: state.fen, myColor: state.myColor }, result => {
+          const fresh = captureBoardState(true);
+          if (!fresh || fresh.positionKey !== state.positionKey || !Array.isArray(result?.heatmap)) return;
+          cachedMoves.heatmap = result.heatmap;
+          renderPremovePreviewOverlay(fresh, null);
+        });
+      }
+      return;
+    }
     const localPlan = computeLocalInstantPremovePlan(state);
     if (localPlan && localPlan.canPremove && localPlan.premove) {
       // Local/book data is a preview. The background validates the move against
@@ -5747,7 +6084,8 @@
       shutdownOrphanedScript();
       return;
     }
-    if (document.hidden) return;
+    if (document.hidden || (mobileSession && !mobileSession.isReady)) return;
+    if (mobileSession && window.__CC_ANDROID_SETTINGS_OPEN__ === true) return;
     if (forceByButton) clearAnalysisRetry();
 
     ensurePanel();
@@ -5769,6 +6107,12 @@
     }
     if (state.animating) return;
     adoptPositionState(state);
+    const mobileConfigKey = mobileSession ? getMobileAnalysisConfig() : "";
+    mobileSession?.observe(state, mobileConfigKey);
+    if (mobileSession && isNativeAutoBlocked(state) && state.actualTurn === state.myColor) {
+      releaseEngineForNativeBlock();
+      return;
+    }
     if (pendingAnalysisRetry && (pendingAnalysisRetry.url !== location.href || pendingAnalysisRetry.positionKey !== state.positionKey)) clearAnalysisRetry();
     if (!forceByButton && (isExecutingMove || Date.now() < moveCooldownUntil)) return;
     if (!forceByButton && pendingAnalysisRetry &&
@@ -5800,12 +6144,18 @@
       }
       committedBoardKey = "";
 
+      if (mobileSession) StockfishWasmEngine.terminate();
       handleEnemyTurnInstantPremove(state);
       return;
     }
 
     if (standbyBox) standbyBox.style.display = "none";
     if (activeBox) activeBox.style.display = "flex";
+    if (mobileSession && !mobileSession.canAnalyze(state, forceByButton)) return;
+    if (mobileSession?.hasAnalysis(state.positionKey, mobileConfigKey)) {
+      if (cachedMoves.best && isCachedAnalysisCurrent(state)) scheduleAutoMoveIfNeeded();
+      return;
+    }
 
     if (!forceByButton && state.boardKey === committedBoardKey) {
       if (
@@ -5822,6 +6172,9 @@
       return;
     }
 
+    const lease = mobileSession?.beginAnalysis(state, mobileConfigKey);
+    if (mobileSession && !lease) return;
+    mobileAnalysisLease = lease || null;
     committedBoardKey = state.boardKey;
     committedEnemyBoardKey = "";
     preparedLookahead = null;
@@ -5840,7 +6193,7 @@
     const normalizedElo = Number.isFinite(Number(currentElo))
       ? Math.max(400, Math.min(3000, Math.round(Number(currentElo))))
       : 2000;
-    const isTurboActive = Boolean(currentElo < 2000 && (bulletTurboMode || (workMode !== "legit" && mySecs <= 15)));
+    const isTurboActive = Boolean(currentElo < 2000 && (mobileSession ? mobileSession.effective().bulletTurboMode : (bulletTurboMode || (workMode !== "legit" && mySecs <= 15))));
     const historyTrusted = Boolean(gameStartedFromInitial && state.sideToAnalyze === state.actualTurn);
     const engineUciHistory = historyTrusted ? uciHistoryList : [];
     const needAvg = Boolean(!engineMaxMode && (showAverageMove || (currentElo < 2000 && useAverageMoveSometimes)) && workMode !== "hvh");
@@ -5867,11 +6220,11 @@
         historyTrusted,
         meta: fastMeta
       },
-      (fastRes) => {
+      async (fastRes) => {
         const responseMeta = fastRes?.meta || fastMeta;
         if (myReqId !== analysisRequestId || !isCurrentAnalysisMeta(responseMeta)) return;
         if (!fastRes || !fastRes.best || fastRes.error) {
-          activeEngineBoardKey = "";
+          finishCurrentAnalysis(myReqId, "failed");
           clearPositionPresentation(fastRes?.error ? "ОШИБКА АНАЛИЗА • ПОВТОР..." : "МАТ / ПАТ • НЕТ ХОДОВ");
           committedBoardKey = state.boardKey;
           boardDirty = false;
@@ -5892,7 +6245,7 @@
           (!requiresFinalEngine && isTurboActive && !fastRes.isDangerPosition && !fastRes.hangingSquare)
         ) {
           if (deepBadge) deepBadge.style.display = "none";
-          if (myReqId === analysisRequestId) activeEngineBoardKey = "";
+          finishCurrentAnalysis(myReqId);
           return;
         }
 
@@ -5909,6 +6262,12 @@
         const wasmPromise = shouldRunWasm
           ? StockfishWasmEngine.analyze(state.fen, wasmMovetime, needAvg ? 3 : 1, engineUciHistory, historyTrusted, { ...deepMeta, elo: normalizedElo, engineMax: engineMaxMode, engineMaxMode, isDangerPosition: Boolean(fastRes.isDangerPosition || fastRes.hangingSquare), needAverage: needAvg })
           : Promise.resolve(null);
+        if (shouldRunWasm && window.__CC_ANDROID_RUNTIME__) {
+          const dispatch = await StockfishWasmEngine.whenDispatched();
+          if (myReqId !== analysisRequestId || !isCurrentAnalysisMeta(deepMeta)) return;
+          deepMeta.ownedEngineRequestId = dispatch?.requestId || "";
+          deepMeta.annotationOnly = true;
+        }
 
         safeSendMessage(
           {
@@ -5951,13 +6310,13 @@
             const requiresFinalEngine = engineMaxMode || currentElo >= 2000 || Boolean(finalDeep?.analysisIncomplete);
             if (!backgroundDeepOk && !wasmApplied && !requiresFinalEngine) {
               if (deepBadge) deepBadge.style.display = "none";
-              if (myReqId === analysisRequestId) activeEngineBoardKey = "";
+              finishCurrentAnalysis(myReqId);
               return;
             }
 
             const hasFinalEngine = Boolean(finalDeep?.engineMeta || finalDeep?.syzygyActive || finalDeep?.best?.fromSyzygy);
             if (requiresFinalEngine && !hasFinalEngine) {
-              if (myReqId === analysisRequestId) activeEngineBoardKey = "";
+              finishCurrentAnalysis(myReqId, "failed");
               if (!useStockfishWasm) {
                 if (deepBadge) deepBadge.style.display = "none";
                 committedBoardKey = state.boardKey;
@@ -5976,6 +6335,7 @@
                 if (deepBadge) deepBadge.style.display = "none";
                 committedBoardKey = state.boardKey;
                 setAutoStatusText("STOCKFISH недоступен • автоход заблокирован", "#ff2a85");
+                scheduleEngineRecovery(state);
               }
               return;
             }
@@ -5986,7 +6346,7 @@
             finalDeep.meta = deepMeta;
             finalDeep.pass = "deep";
             applyAnalysisResult(state, finalDeep, true, firstBestUci);
-            if (myReqId === analysisRequestId) activeEngineBoardKey = "";
+            finishCurrentAnalysis(myReqId);
           }
         );
       }
@@ -5995,7 +6355,14 @@
 
   let rafPending = false;
   function triggerDebouncedCycle() {
-    if (extensionInvalidated || rafPending || isExecutingMove || Date.now() < moveCooldownUntil) return;
+    if (extensionInvalidated || document.hidden || (mobileSession && !mobileSession.isReady) || rafPending || isExecutingMove) return;
+    if (Date.now() < moveCooldownUntil) {
+      if (mobileSession && !cycleWakeTimer) cycleWakeTimer = setTimeout(() => {
+        cycleWakeTimer = null;
+        triggerDebouncedCycle();
+      }, Math.max(16, moveCooldownUntil - Date.now()));
+      return;
+    }
     rafPending = true;
     requestAnimationFrame(() => {
       rafPending = false;
@@ -6007,9 +6374,22 @@
   let observedMovesNode = null;
 
   const domObserver = new MutationObserver((mutations) => {
-    if (mutations.length) markBoardDirty("MOVE");
-    triggerDebouncedCycle();
+    if (!mutations.length) return;
+    clearTimeout(boardMutationTimer);
+    boardMutationTimer = setTimeout(() => {
+      boardMutationTimer = null;
+      markBoardDirty("MOVE");
+      triggerDebouncedCycle();
+    }, 120);
   });
+  const boardDiscoveryObserver = mobileSession ? new MutationObserver(mutations => {
+    if (mutations.some(mutation => [...(mutation.addedNodes || []), ...(mutation.removedNodes || [])].some(node =>
+      node?.matches?.("cg-board, .round__app__table, .analyse__moves") || node?.querySelector?.("cg-board, .round__app__table, .analyse__moves")
+    ))) {
+      ensureObserversAttached();
+      triggerDebouncedCycle();
+    }
+  }) : null;
 
   function ensureObserversAttached() {
     if (extensionInvalidated || !isContextValid()) return;
@@ -6026,6 +6406,7 @@
       if (cgBoard) {
         domObserver.observe(cgBoard, {
           childList: true,
+          subtree: true,
           attributes: true,
           attributeFilter: ["class", "style"]
         });
@@ -6055,11 +6436,54 @@
     renderArrowsOverlay(state, cachedMoves);
   };
 
-  loadSettings();
-  ensureObserversAttached();
+  function scheduleMobilePoll() {
+    clearTimeout(mobilePollTimer);
+    if (extensionInvalidated || document.hidden || !mobileSession?.isReady) return;
+    mobilePollTimer = setTimeout(() => {
+      mobilePollTimer = null;
+      if (extensionInvalidated || document.hidden) return;
+      ensureObserversAttached();
+       if (!nativeMoveBlockedState && !isExecutingMove && Date.now() >= moveCooldownUntil) runCycle(false);
+       scheduleMobilePoll();
+    }, nativeMoveBlockedState ? 5000 : 1600);
+  }
+
+  const settingsReady = loadSettings();
+  if (mobileSession) {
+    Promise.all([settingsReady, mobileSession.ready]).then(() => {
+      if (extensionInvalidated) return;
+      unregisterMobileCore = mobileSession.registerCore("lichess", {
+        captureState: () => captureBoardState(true),
+        isAnimating: board => Boolean(board.querySelector("piece.anim, piece.dragging")),
+        viewState: () => ({ executing: isExecutingMove, bestUci: cachedMoves.best?.uci || null,
+          finalAnalysis: hasFinalAutoAnalysis(cachedMoves), retryPending: Boolean(pendingAnalysisRetry), nativeInputBlocked: Boolean(nativeMoveBlockedState) }),
+        cancelSearch() {
+          analysisRequestId++;
+          positionAnalysisId++;
+          activeEngineBoardKey = "";
+          mobileAnalysisLease = null;
+          StockfishWasmEngine.cancel();
+          clearAnalysisRetry();
+        },
+        suspend: suspendMobileCore,
+        resume() {
+          boardDirty = true;
+          ensureObserversAttached();
+          if (!flushDeferredRecalculate()) triggerDebouncedCycle();
+          scheduleMobilePoll();
+        },
+        refreshVisuals() { mobileSession.applyVisualPolicy(shadowRoot); triggerDebouncedCycle(); }
+      });
+      boardDiscoveryObserver.observe(document.documentElement, { childList: true, subtree: true });
+      mobileSession.applyVisualPolicy(shadowRoot);
+      ensureObserversAttached();
+      triggerDebouncedCycle();
+      scheduleMobilePoll();
+    }).catch(error => mobileSession.reportError(error));
+  } else ensureObserversAttached();
 
   let lastIdleBoardPollAt = 0;
-  mainIntervalId = setInterval(() => {
+  if (!mobileSession) mainIntervalId = setInterval(() => {
     if (extensionInvalidated || !isContextValid()) {
       shutdownOrphanedScript();
       return;

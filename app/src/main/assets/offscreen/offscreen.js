@@ -89,7 +89,14 @@
     if (!job || job.settled) return;
     job.settled = true;
     clearTimeout(job.timer);
-    try { job.sendResponse(payload); } catch (e) {}
+    const replies = [job, ...(job.followers || [])];
+    job.followers = [];
+    for (const reply of replies) {
+      reply.settled = true;
+      clearTimeout(reply.timer);
+      const result = payload.result ? { ...payload.result, meta: reply.meta } : undefined;
+      try { reply.sendResponse({ ...payload, requestId: reply.requestId, ...(result ? { result } : {}) }); } catch (e) {}
+    }
   }
 
   function clearEngineTimers() {
@@ -422,6 +429,18 @@
   function enqueue(job) {
     clearTimeout(idleTimer);
     idleEpoch++;
+    const cacheKey = getCacheKey(job);
+    const equivalent = [activeJob, ...queue].find(current => current?.clientKey === job.clientKey &&
+      !current.settled && !current.cancelled && !current.timedOut && getCacheKey(current) === cacheKey);
+    if (equivalent) {
+      equivalent.followers ||= [];
+      if (equivalent.followers.length >= 32) {
+        settle(job, response(false, job.requestId, { code: "QUEUE_FULL" }));
+      } else {
+        equivalent.followers.push(job);
+      }
+      return;
+    }
     for (let index = queue.length - 1; index >= 0; index--) {
       if (queue[index].clientKey !== job.clientKey) continue;
       queue[index].cancelled = true;
@@ -429,7 +448,6 @@
       queue.splice(index, 1);
     }
     if (activeJob?.clientKey === job.clientKey) cancelClient(job.clientKey, "SUPERSEDED");
-    const cacheKey = getCacheKey(job);
     const cached = resultCache.get(cacheKey);
     if (cached) {
       resultCache.delete(cacheKey);

@@ -675,7 +675,10 @@
     let readyBackend = null;
     let initPromise = null;
     let fullRetryAt = 0;
-    let releasePromise = Promise.resolve();
+    let releasePromise = null;
+    let dispatchPromise = Promise.resolve(null);
+    let resolveDispatch = null;
+    let activeMeta = null;
 
     function currentResources() {
       const preferred = getPreferredResourceProfile();
@@ -701,7 +704,7 @@
       const token = generation;
       const resources = currentResources();
       const pending = (async () => {
-        await releasePromise;
+        if (releasePromise) await releasePromise;
         if (token !== generation || !usable()) return false;
         try {
           const { promise } = send("ENGINE_INIT", { backend: resources.backend, hashMb: resources.primaryHashMb });
@@ -725,26 +728,33 @@
     }
 
     async function analyze(fen, movetimeMs = 190, multiPv = 3, uciMoves = [], useStartposMoves = false, meta = null) {
-      if (!usable() || typeof fen !== "string" || !fen.trim() || /[\r\n]/.test(fen)) return null;
-      ownedEngines.add(handle);
-      const token = ++generation;
-      await releasePromise;
-      if (token !== generation || !usable()) return null;
-      const resources = currentResources();
-      const time = Math.max(20, Math.min(getAndroidCapability().maxMovetimeMs, Number(movetimeMs) || 190));
-      const effectiveMeta = { ...(meta || {}), performanceMode: "normal" };
-      const { requestId, promise } = send("ENGINE_ANALYZE", {
-        backend: resources.backend,
-        fen,
-        movetimeMs: Math.round(time),
-        multiPv: Math.max(1, Math.min(2, Math.floor(Number(multiPv) || 1))),
-        uciMoves: [],
-        useStartposMoves: false,
-        hashMb: resources.primaryHashMb,
-        meta: effectiveMeta
-      });
-      activeRequestId = requestId;
+      resolveDispatch?.(null);
+      let dispatched;
+      dispatchPromise = new Promise(resolve => { dispatched = resolve; });
+      resolveDispatch = dispatched;
+      let token = generation;
+      let resources = null;
+      let requestId = null;
       try {
+        if (!usable() || typeof fen !== "string" || !fen.trim() || /[\r\n]/.test(fen)) return null;
+        ownedEngines.add(handle);
+        token = ++generation;
+        const effectiveMeta = { ...(meta || {}), performanceMode: meta?.performanceMode || "normal" };
+        activeMeta = effectiveMeta;
+        if (releasePromise) await releasePromise;
+        if (token !== generation || !usable()) return null;
+        resources = currentResources();
+        const time = Math.max(20, Math.min(getAndroidCapability().maxMovetimeMs, Number(movetimeMs) || 190));
+        const sent = send("ENGINE_ANALYZE", {
+          backend: resources.backend, fen, movetimeMs: Math.round(time),
+          multiPv: Math.max(1, Math.min(2, Math.floor(Number(multiPv) || 1))),
+          uciMoves: [], useStartposMoves: false, hashMb: resources.primaryHashMb, meta: effectiveMeta
+        });
+        requestId = sent.requestId;
+        activeRequestId = requestId;
+        dispatched({ requestId });
+        if (resolveDispatch === dispatched) resolveDispatch = null;
+        const promise = sent.promise;
         const response = await promise;
         if (token !== generation) return null;
         if (response?.ok && response.result?.searchCompleted === true && UCI_MOVE.test(response.result.bestUci || "") && response.result.lines?.[1]?.uci === response.result.bestUci) {
@@ -759,17 +769,21 @@
       } catch (error) {
         if (token !== generation) return null;
         readyBackend = null;
-        if (resources.fullNnue && error.code !== "ENGINE_SUSPENDED") fullRetryAt = Date.now() + 5000;
-        void send("ENGINE_CANCEL", {}, 5000).promise.catch(() => {});
+        if (resources?.fullNnue && error.code !== "ENGINE_SUSPENDED") fullRetryAt = Date.now() + 5000;
+        if (requestId) void send("ENGINE_CANCEL", { meta: activeMeta }, 5000).promise.catch(() => {});
         return null;
       } finally {
+        dispatched(null);
+        if (resolveDispatch === dispatched) resolveDispatch = null;
         if (activeRequestId === requestId) activeRequestId = null;
       }
     }
 
     function cancel() {
       generation++;
-      if (activeRequestId) void send("ENGINE_CANCEL", {}, 5000).promise.catch(() => {});
+      resolveDispatch?.(null);
+      resolveDispatch = null;
+      if (activeRequestId || activeMeta) void send("ENGINE_CANCEL", { meta: activeMeta, cancelAnalysis: true }, 5000).promise.catch(() => {});
       activeRequestId = null;
     }
 
@@ -781,11 +795,17 @@
       initPromise = null;
       fullRetryAt = 0;
       ownedEngines.delete(handle);
-      releasePromise = send("ENGINE_RELEASE", {}, 5000).promise.catch(() => {});
+      resolveDispatch?.(null);
+      resolveDispatch = null;
+      const releasing = send("ENGINE_RELEASE", { meta: activeMeta, cancelAnalysis: true }, 5000).promise.catch(() => {});
+      activeMeta = null;
+      releasePromise = releasing;
+      releasing.finally(() => { if (releasePromise === releasing) releasePromise = null; });
     }
 
     const handle = {
       initWorker, analyze, cancel, terminate,
+      whenDispatched: () => dispatchPromise,
       isReady: () => readyBackend === currentResources().backend,
       getHashMb: () => currentResources().totalHashMb,
       getResourceProfile: () => ({ ...currentResources() })

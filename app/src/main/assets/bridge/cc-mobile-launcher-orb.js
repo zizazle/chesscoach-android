@@ -7,34 +7,12 @@
   try { previousInstance?.cleanup?.("reinjection"); } catch (e) {}
 
   const currentPlatform = location.hostname.includes("chess.com") ? "chesscom" : "lichess";
-  const platformPrefix = `${currentPlatform}.`;
+  const preferences = window.__CC_MOBILE_PREFERENCES__;
   const calibrationKey = `cc_mobile_calibrated_${currentPlatform}`;
-  const GLOBAL_DEFAULTS = Object.freeze({
-    cc_mobile_ui_view_mode: "full",
-    cc_mobile_ingame_submode: "mini",
-    cc_mobile_last_welcome_date: "",
-    cc_mobile_platform: currentPlatform,
-    cc_mobile_mini_hud_pos: null,
-    cc_mobile_settings_tab: "presets",
-    [calibrationKey]: false
-  });
-  const LEGACY_GLOBAL_KEYS = Object.freeze({
-    cc_ui_view_mode: "cc_mobile_ui_view_mode",
-    cc_ingame_submode: "cc_mobile_ingame_submode",
-    cc_last_welcome_date: "cc_mobile_last_welcome_date",
-    cc_mini_hud_pos: "cc_mobile_mini_hud_pos"
-  });
-  const ENGINE_CONTROL_IDS = new Set([
-    "cc-elo-slider", "cc-sf-wasm-chk", "cc-engine-max-chk", "cc-auto-master-chk", "cc-premove-chk",
-    "cc-premove-arrows-chk", "cc-auto-delay-slider", "cc-auto-jitter-slider",
-    "cc-auto-avg-chk", "cc-auto-avg-freq-slider", "cc-auto-protect-chk",
-    "cc-vis-arrow-style", "cc-vis-arrows-chk", "cc-vis-eval-chk", "cc-vis-phonk-chk",
-    "cc-audio-radar-chk", "cc-heatmap-always-chk", "cc-rage-antiban-chk"
-  ]);
 
   let destroyed = false;
   let storageReady = false;
-  let initialStorage = { ...GLOBAL_DEFAULTS };
+  let initialStorage = preferences?.getStorage() || {};
   let uiViewMode = "full";
   let lastInGameSubMode = "mini";
   let mainHudHost = null;
@@ -50,10 +28,11 @@
   let presetStatus = null;
   let pendingAutomation = null;
   let applyingPreset = false;
-  let forceAutomationOffOnBoot = false;
   let welcomeSequenceStarted = false;
   let welcomeDismissedByBack = false;
   let rootSetupComplete = false;
+  let pendingFullModeRequest = false;
+  let hudRecoveryRetryScheduled = false;
   let overlayPassthrough = false;
   let miniUpdateRaf = 0;
   let dragState = null;
@@ -72,132 +51,23 @@
     cleanup
   };
 
-  function hasStorage() {
+  async function saveGlobalPatch(patch) {
     try {
-      return typeof chrome !== "undefined" && Boolean(chrome.storage?.local);
-    } catch (e) {
+      if (!preferences) return false;
+      await preferences.updateGlobal(patch);
+      initialStorage = preferences.getStorage();
+      return true;
+    } catch (error) {
+      console.warn("[ChessCoach Android] Mobile UI preferences were not saved", error);
       return false;
     }
   }
 
-  function hasRuntimeLastError() {
-    try { return Boolean(chrome.runtime?.lastError); } catch (e) { return true; }
-  }
-
-  function storageGet(keys) {
-    return new Promise((resolve) => {
-      if (!hasStorage()) {
-        resolve({});
-        return;
-      }
-      let settled = false;
-      const finish = (value) => {
-        if (settled) return;
-        settled = true;
-        resolve(!hasRuntimeLastError() && value && typeof value === "object" ? value : {});
-      };
-      try {
-        const maybePromise = chrome.storage.local.get(keys, finish);
-        if (maybePromise && typeof maybePromise.then === "function") {
-          maybePromise.then(finish, () => finish({}));
-        }
-      } catch (e) {
-        finish({});
-      }
-    });
-  }
-
-  function storageSet(patch) {
-    return new Promise((resolve) => {
-      if (!hasStorage() || !patch || typeof patch !== "object") {
-        resolve(false);
-        return;
-      }
-      let settled = false;
-      const finish = (success = true) => {
-        if (settled) return;
-        settled = true;
-        resolve(Boolean(success && !hasRuntimeLastError()));
-      };
-      try {
-        const maybePromise = chrome.storage.local.set(patch, finish);
-        if (maybePromise && typeof maybePromise.then === "function") {
-          maybePromise.then(() => finish(true), () => finish(false));
-        }
-      } catch (e) {
-        resolve(false);
-      }
-    });
-  }
-
-  function storageRemove(keys) {
-    return new Promise((resolve) => {
-      if (!hasStorage() || typeof chrome.storage.local.remove !== "function") {
-        resolve(false);
-        return;
-      }
-      let settled = false;
-      const finish = (success = true) => {
-        if (settled) return;
-        settled = true;
-        resolve(Boolean(success && !hasRuntimeLastError()));
-      };
-      try {
-        const maybePromise = chrome.storage.local.remove(keys, finish);
-        if (maybePromise && typeof maybePromise.then === "function") {
-          maybePromise.then(() => finish(true), () => finish(false));
-        }
-      } catch (e) {
-        resolve(false);
-      }
-    });
-  }
-
-  async function saveGlobalPatch(patch) {
-    const safePatch = {};
-    for (const [key, value] of Object.entries(patch || {})) {
-      if (key.startsWith("cc_mobile_")) safePatch[key] = value;
-    }
-    if (!Object.keys(safePatch).length) return false;
-    const saved = await storageSet(safePatch);
-    if (saved) Object.assign(initialStorage, safePatch);
-    return saved;
-  }
-
-  async function savePlatformPatch(patch) {
-    const scoped = {};
-    for (const [key, value] of Object.entries(patch || {})) {
-      if (!key || key.startsWith("cc_mobile_") || key.includes(".")) continue;
-      scoped[platformPrefix + key] = value;
-    }
-    if (!Object.keys(scoped).length) return false;
-    const saved = await storageSet(scoped);
-    if (saved) Object.assign(initialStorage, scoped);
-    return saved;
-  }
-
   async function loadInitialStorage() {
-    const stored = await storageGet(null);
-    initialStorage = { ...GLOBAL_DEFAULTS, ...stored };
-    const migration = {};
-    const removeKeys = [];
-    for (const [legacyKey, globalKey] of Object.entries(LEGACY_GLOBAL_KEYS)) {
-      if (stored[globalKey] === undefined && stored[legacyKey] !== undefined) {
-        migration[globalKey] = stored[legacyKey];
-      }
-      if (stored[legacyKey] !== undefined) removeKeys.push(legacyKey);
-    }
-    if (stored.cc_onboarding_done === true && stored[calibrationKey] === undefined) {
-      migration[calibrationKey] = true;
-    }
-    if (stored.cc_onboarding_done !== undefined) removeKeys.push("cc_onboarding_done");
-    const migrationSaved = !Object.keys(migration).length || await saveGlobalPatch(migration);
-    if (migrationSaved && removeKeys.length) await storageRemove(removeKeys);
-    forceAutomationOffOnBoot = stored[`${platformPrefix}autoMoveEnabled`] === undefined;
-    if (forceAutomationOffOnBoot) {
-      await savePlatformPatch({ autoMoveEnabled: false, premoveEnabled: false, showPremoveArrows: false });
-    }
-
+    if (!preferences) throw new Error("Mobile preference authority is unavailable");
+    await preferences.ready;
+    if (destroyed) return;
+    initialStorage = preferences.getStorage();
     uiViewMode = ["full", "mini", "pill"].includes(initialStorage.cc_mobile_ui_view_mode)
       ? initialStorage.cc_mobile_ui_view_mode
       : "full";
@@ -205,6 +75,11 @@
       ? initialStorage.cc_mobile_ingame_submode
       : "mini";
     storageReady = true;
+    listenerCleanups.push(preferences.subscribe(currentPlatform, () => {
+      initialStorage = preferences.getStorage();
+      renderPreferenceStatus();
+    }));
+    renderPreferenceStatus();
   }
 
   function nativeRequest(method, params) {
@@ -587,10 +462,10 @@
       const playButton = mainHudShadow.getElementById("cc-play-once");
       if (playButton && !playButton.disabled) playButton.click();
     });
-    listen(hudShadow.getElementById("cc-mini-settings-btn"), "click", () => setUiViewMode("full"));
+    listen(hudShadow.getElementById("cc-mini-settings-btn"), "click", requestFullUi);
     listen(hudShadow.getElementById("cc-mini-close-btn"), "click", () => setUiViewMode("pill"));
     listen(hudShadow.getElementById("cc-corner-restore-hud-btn"), "click", () => setUiViewMode("mini"));
-    listen(hudShadow.getElementById("cc-corner-open-settings-btn"), "click", () => setUiViewMode("full"));
+    listen(hudShadow.getElementById("cc-corner-open-settings-btn"), "click", requestFullUi);
     listen(hudShadow.getElementById("cc-auto-stay-off"), "click", () => {
       vibrate(10);
       pendingAutomation = null;
@@ -727,6 +602,74 @@
     listen(handle, "pointercancel", finishDrag);
   }
 
+  function showHudRecoveryStatus() {
+    const message = "Ядро загружается. Если меню не появится, перезапустите страницу.";
+    const reason = hudShadow?.getElementById("cc-mini-tech-reason");
+    const corner = hudShadow?.getElementById("cc-corner-move-short");
+    if (reason) reason.textContent = message;
+    if (corner) corner.textContent = "ЯДРО...";
+    for (const button of [
+      hudShadow?.getElementById("cc-mini-settings-btn"),
+      hudShadow?.getElementById("cc-corner-open-settings-btn")
+    ]) {
+      if (button) button.title = message;
+    }
+  }
+
+  function clearHudRecoveryStatus() {
+    const reason = hudShadow?.getElementById("cc-mini-tech-reason");
+    const corner = hudShadow?.getElementById("cc-corner-move-short");
+    if (reason?.textContent.startsWith("Ядро загружается")) {
+      reason.textContent = "Откройте партию или сделайте ход для расчёта.";
+    }
+    if (corner?.textContent === "ЯДРО...") corner.textContent = "АНАЛИЗ";
+    for (const button of [
+      hudShadow?.getElementById("cc-mini-settings-btn"),
+      hudShadow?.getElementById("cc-corner-open-settings-btn")
+    ]) {
+      if (button) button.removeAttribute("title");
+    }
+  }
+
+  function resetDisconnectedHudRegistration() {
+    if (!rootSetupComplete || mainPanel?.isConnected) return;
+    rootSetupComplete = false;
+    mainPanel = null;
+    mainHudHost = null;
+    mainHudShadow = null;
+    hudDataObserver?.disconnect();
+    scriptsObserver?.disconnect();
+    hudDataObserver = null;
+    scriptsObserver = null;
+    stopHudDiscovery();
+    if (window.__CC_ANDROID_HUD_ROOT__ && !window.__CC_ANDROID_HUD_ROOT__.host?.isConnected) {
+      delete window.__CC_ANDROID_HUD_ROOT__;
+    }
+  }
+
+  function retryHudDiscovery() {
+    resetDisconnectedHudRegistration();
+    startHudDiscovery();
+    if (hudRecoveryRetryScheduled) return;
+    hudRecoveryRetryScheduled = true;
+    schedule(() => {
+      hudRecoveryRetryScheduled = false;
+      resetDisconnectedHudRegistration();
+      startHudDiscovery();
+    }, 750);
+  }
+
+  function requestFullUi() {
+    if (mainPanel?.isConnected) {
+      setUiViewMode("full");
+      return;
+    }
+    pendingFullModeRequest = true;
+    showHudRecoveryStatus();
+    retryHudDiscovery();
+    syncVisibilityStates();
+  }
+
   function setUiViewMode(newMode) {
     if (!["full", "mini", "pill"].includes(newMode)) return;
     const modeChanged = uiViewMode !== newMode;
@@ -747,14 +690,16 @@
   }
 
   function syncVisibilityStates() {
-    window.__CC_ANDROID_SETTINGS_OPEN__ = uiViewMode === "full";
+    const settingsVisible = uiViewMode === "full" && Boolean(mainPanel?.isConnected);
+    const visibleMode = uiViewMode === "full" && !settingsVisible ? lastInGameSubMode : uiViewMode;
+    window.__CC_ANDROID_SETTINGS_OPEN__ = settingsVisible;
     if (mainPanel) {
       mainPanel.classList.toggle("cc-mobile-hidden", uiViewMode !== "full");
       if (uiViewMode === "full") mainPanel.classList.remove("cc-minimized");
     }
     if (!miniHudCard || !cornerPill) return;
-    const showMini = uiViewMode === "mini" && document.visibilityState === "visible";
-    const showPill = uiViewMode === "pill" && document.visibilityState === "visible";
+    const showMini = visibleMode === "mini" && document.visibilityState === "visible";
+    const showPill = visibleMode === "pill" && document.visibilityState === "visible";
     miniHudCard.style.display = showMini ? "block" : "none";
     miniHudCard.setAttribute("aria-hidden", showMini ? "false" : "true");
     cornerPill.style.display = showPill ? "flex" : "none";
@@ -830,6 +775,7 @@
     if (destroyed || rootSetupComplete || root !== mainHudShadow) return;
     rootSetupComplete = true;
     mainPanel = panel;
+    clearHudRecoveryStatus();
     stopHudDiscovery();
 
     if (!root.getElementById("cc-mobile-override-style")) {
@@ -843,11 +789,14 @@
     applyDeviceClasses();
     setupMobileSettingsHub(root, panel);
     installHudDataSync(root);
-    installCalibrationMarker(root);
     disableAndroidUserScripts(root);
-    enforceInitialAutomationDefault();
     if (deviceRecommendation.tier === "LOW") enforceLowTierRestrictions();
-    syncVisibilityStates();
+    if (pendingFullModeRequest) {
+      pendingFullModeRequest = false;
+      setUiViewMode("full");
+    } else {
+      syncVisibilityStates();
+    }
     maybeStartWelcomeSequence();
   }
 
@@ -989,6 +938,7 @@
     `;
     mainView.prepend(pane);
     presetStatus = pane.querySelector("#cc-mobile-preset-status");
+    renderPreferenceStatus();
 
     const activatePresetTab = () => {
       root.querySelectorAll(".cc-tab-btn").forEach((button) => {
@@ -1140,8 +1090,9 @@
     const subtitle = button?.querySelector(".cc-platform-card-sub");
     if (button) button.disabled = true;
     if (subtitle) subtitle.textContent = "Загрузка...";
-    await saveGlobalPatch({ cc_mobile_platform: platform });
     try {
+      if (!await saveGlobalPatch({ cc_mobile_platform: platform })) throw new Error("Storage is unavailable");
+      await preferences.flush();
       await nativeRequest("platform.switch", { platform: platform === "lichess" ? "LICHESS" : "CHESS_COM" });
     } catch (e) {
       if (button) button.disabled = false;
@@ -1149,134 +1100,52 @@
     }
   }
 
-  function dispatchInput(element, type) {
-    element.dispatchEvent(new Event(type, { bubbles: true, composed: true }));
-  }
-
-  function setCheckbox(id, checked, required = false) {
-    const element = mainHudShadow?.getElementById(id);
-    if (!element) return !required;
-    if (element.checked !== Boolean(checked)) {
-      element.checked = Boolean(checked);
-      dispatchInput(element, "change");
-    }
-    return element.checked === Boolean(checked);
-  }
-
-  function setInputValue(id, value, required = false) {
-    const element = mainHudShadow?.getElementById(id);
-    if (!element) return !required;
-    if (element.type === "range" && !Number.isFinite(Number(value))) return false;
-    const previous = element.value;
-    element.value = String(value);
-    const normalized = element.type === "range" ? element.value : String(value);
-    if (previous !== element.value) {
-      dispatchInput(element, "input");
-      dispatchInput(element, "change");
-    }
-    return element.value === normalized;
-  }
-
-  function clickSelector(selector, required = false) {
-    const element = mainHudShadow?.querySelector(selector);
-    if (!element) return !required;
-    element.click();
-    return true;
-  }
-
   function buildPresetConfig({ mode, speed, arrows }) {
-    const isFast = mode === "hvh";
-    const isBalanced = mode === "balance";
+    const mobilePresetId = mode === "hvh" || mode === "fast" ? "fast" : mode === "balance" || mode === "balanced" ? "balanced" : "calm";
+    const isFast = mobilePresetId === "fast";
+    const isBalanced = mobilePresetId === "balanced";
+    const supported = preferences.capabilities(currentPlatform);
     const speedFactor = speed === "bullet" ? 0.7 : speed === "rapid" ? 1.45 : 1;
     const minimumDelay = deviceRecommendation.tier === "LOW" ? 620 : 140;
     const delay = Math.max(minimumDelay, Math.round(deviceRecommendation.delayMs * speedFactor));
     const jitter = Math.max(25, Math.round(delay * (isFast ? 0.16 : 0.32)));
-    const desiredPremove = deviceRecommendation.premove && (isFast || (isBalanced && speed === "bullet"));
+    const desiredPremove = supported.premove && deviceRecommendation.premove && (isFast || (isBalanced && speed === "bullet"));
     return {
       mode,
+      mobilePresetId,
       workMode: "all",
       elo: deviceRecommendation.maxElo,
       style: isFast ? "balanced" : isBalanced ? "hikaru" : "tal",
       useStockfishWasm: deviceRecommendation.useStockfish,
       engineMaxMode: false,
       autoMoveEnabled: false,
-      bulletTurboMode: false,
-      premoveEnabled: false,
-      showPremoveArrows: false,
+      ...(supported.premove ? { bulletTurboMode: false, premoveEnabled: false, showPremoveArrows: false, premoveRiskLevel: 3 } : {}),
+      ...(currentPlatform === "chesscom" ? { humanHesitationEnabled: !isFast, autoT1LimiterEnabled: !isFast, maxSafeT1Percent: 66 } : {}),
       legitAutoTiming: !isFast,
       useAverageMoveSometimes: isBalanced,
       averageMoveFrequency: isBalanced ? 18 : 0,
       protectCriticalMoves: true,
-      safeAntiBanGuard: true,
+      safeAntiBanGuard: false,
+      autoMoveTriggerRate: isFast ? 100 : isBalanced ? 95 : 85,
       autoMoveDelayMs: delay,
       autoMoveJitterMs: jitter,
       arrowStyle: arrows,
       showArrows: true,
       showEvalBar: true,
+      showAverageMove: isBalanced,
+      showWorstMove: false,
+      phonkEditEnabled: false,
+      audioRadarEnabled: false,
+      heatmapAlwaysOn: false,
       mobileAnimations: deviceRecommendation.animations,
       mobileVisualEffects: deviceRecommendation.visualEffects,
-      desiredPremove
+      desiredPremove,
+      desiredTurbo: supported.bulletTurbo && isFast && speed === "bullet" && deviceRecommendation.tier !== "LOW"
     };
   }
 
-  function applyConfigThroughUi(config) {
-    if (!mainHudShadow || document.visibilityState !== "visible") return false;
-    const targetMode = currentPlatform === "chesscom" && config.workMode === "hvh" ? "all" : config.workMode;
-    const requiredControls = ["cc-auto-master-chk", "cc-sf-wasm-chk", "cc-elo-slider", "cc-auto-delay-slider"];
-    if (requiredControls.some((id) => !mainHudShadow.getElementById(id))) return false;
-    if (!mainHudShadow.querySelector(`.cc-mode-btn[data-mode="${targetMode}"]`) ||
-        !mainHudShadow.querySelector(`.cc-style-btn[data-style="${config.style}"]`)) return false;
-    let ok = true;
-
-    ok = setCheckbox("cc-auto-master-chk", false, true) && ok;
-    ok = setCheckbox("cc-premove-chk", false, false) && ok;
-    ok = clickSelector(`.cc-mode-btn[data-mode="${targetMode}"]`, true) && ok;
-
-    ok = setCheckbox("cc-auto-master-chk", false, true) && ok;
-    ok = setCheckbox("cc-premove-chk", false, false) && ok;
-    ok = setCheckbox("cc-premove-arrows-chk", false, false) && ok;
-    ok = setCheckbox("cc-bullet-turbo-chk", false, false) && ok;
-    ok = setCheckbox("cc-engine-max-chk", false, false) && ok;
-    ok = setCheckbox("cc-sf-wasm-chk", config.useStockfishWasm, true) && ok;
-    ok = setInputValue("cc-elo-slider", config.elo, true) && ok;
-    ok = clickSelector(`.cc-style-btn[data-style="${config.style}"]`, true) && ok;
-    ok = setCheckbox("cc-legit-timing-chk", config.legitAutoTiming, false) && ok;
-    ok = setCheckbox("cc-auto-avg-chk", config.useAverageMoveSometimes, false) && ok;
-    ok = setInputValue("cc-auto-avg-freq-slider", config.averageMoveFrequency, false) && ok;
-    ok = setCheckbox("cc-auto-protect-chk", config.protectCriticalMoves, false) && ok;
-    ok = setCheckbox("cc-rage-antiban-chk", config.safeAntiBanGuard, false) && ok;
-    ok = setInputValue("cc-auto-delay-slider", config.autoMoveDelayMs, true) && ok;
-    ok = setInputValue("cc-auto-jitter-slider", config.autoMoveJitterMs, false) && ok;
-    ok = setInputValue("cc-vis-arrow-style", config.arrowStyle, false) && ok;
-    ok = setCheckbox("cc-vis-arrows-chk", config.showArrows, false) && ok;
-    ok = setCheckbox("cc-vis-eval-chk", config.showEvalBar, false) && ok;
-
-    if (!config.mobileVisualEffects) {
-      ok = setCheckbox("cc-vis-phonk-chk", false, false) && ok;
-      ok = setCheckbox("cc-audio-radar-chk", false, false) && ok;
-      ok = setCheckbox("cc-heatmap-always-chk", false, false) && ok;
-    }
-
-    const activeMode = mainHudShadow.querySelector(`.cc-mode-btn[data-mode="${targetMode}"].active`);
-    const activeStyle = mainHudShadow.querySelector(`.cc-style-btn[data-style="${config.style}"].active`);
-    const elo = mainHudShadow.getElementById("cc-elo-slider");
-    const stockfish = mainHudShadow.getElementById("cc-sf-wasm-chk");
-    const auto = mainHudShadow.getElementById("cc-auto-master-chk");
-    const engineMax = mainHudShadow.getElementById("cc-engine-max-chk");
-    for (const [field, id] of [
-      ["elo", "cc-elo-slider"],
-      ["autoMoveDelayMs", "cc-auto-delay-slider"],
-      ["autoMoveJitterMs", "cc-auto-jitter-slider"],
-      ["averageMoveFrequency", "cc-auto-avg-freq-slider"]
-    ]) {
-      const control = mainHudShadow.getElementById(id);
-      if (control && Number.isFinite(Number(control.value))) config[field] = Number(control.value);
-    }
-    return Boolean(ok && activeMode && activeStyle && elo?.value === String(config.elo) && stockfish?.checked && !auto?.checked && !engineMax?.checked);
-  }
-
   function persistablePresetConfig(config) {
-    const { mode, desiredPremove, ...persisted } = config;
+    const { mode, desiredPremove, desiredTurbo, ...persisted } = config;
     return persisted;
   }
 
@@ -1285,28 +1154,26 @@
     applyingPreset = true;
     vibrate(22);
     setPresetStatus("Применение профиля...", "#ffbe0b");
-    const config = buildPresetConfig(selection);
     try {
-      const applied = applyConfigThroughUi(config);
-      if (!applied) {
-        setPresetStatus("Профиль не сохранён: core UI ещё не готов.", "#ff7b9f");
-        return false;
-      }
-      const saved = await savePlatformPatch(persistablePresetConfig(config));
-      if (!saved) {
-        setPresetStatus("Профиль применён только на текущую сессию: storage недоступен.", "#ffbe0b");
-        return false;
-      }
-      await saveGlobalPatch({ [calibrationKey]: true });
+      await preferences.ready;
+      if (destroyed || document.visibilityState !== "visible") return false;
+      const config = buildPresetConfig(selection);
+      await preferences.update(currentPlatform, persistablePresetConfig(config), {
+        source: "preset", presetId: config.mobilePresetId, recalculate: true, global: { [calibrationKey]: true }
+      });
       setPresetStatus(`Профиль ${deviceRecommendation.tier} применён. Автоход выключен.`, "#70e000");
       pendingAutomation = {
         autoMoveEnabled: true,
-        premoveEnabled: Boolean(config.desiredPremove && deviceRecommendation.tier !== "LOW"),
-        showPremoveArrows: Boolean(config.desiredPremove && deviceRecommendation.tier !== "LOW"),
-        bulletTurboMode: false
+        mobilePresetId: config.mobilePresetId,
+        ...(preferences.capabilities(currentPlatform).premove ? {
+          premoveEnabled: Boolean(config.desiredPremove), showPremoveArrows: Boolean(config.desiredPremove), bulletTurboMode: Boolean(config.desiredTurbo)
+        } : {})
       };
       showAutoConfirmation();
       return true;
+    } catch (error) {
+      setPresetStatus("Профиль не сохранён: " + compactText(error?.message, 120), "#ff7b9f");
+      return false;
     } finally {
       applyingPreset = false;
     }
@@ -1316,6 +1183,13 @@
     if (!presetStatus) return;
     presetStatus.textContent = text;
     if (color) presetStatus.style.color = color;
+  }
+
+  function renderPreferenceStatus() {
+    if (!preferences?.isReady || !presetStatus) return;
+    const saved = preferences.get(currentPlatform);
+    const names = { calm: "Спокойный", fast: "Быстрый", balanced: "Сбалансированный", custom: "Пользовательский" };
+    setPresetStatus(`${names[saved.mobilePresetId]} профиль сохранён. Автоход ${saved.autoMoveEnabled ? "включён" : "выключен"}.`, saved.autoMoveEnabled ? "#ffbe0b" : "#70e000");
   }
 
   function showAutoConfirmation() {
@@ -1334,45 +1208,27 @@
     const requested = pendingAutomation;
     pendingAutomation = null;
     hideOverlay(autoConfirmModal);
-    setUiViewMode(lastInGameSubMode);
-
-    let ok = setCheckbox("cc-auto-master-chk", true, true);
-    if (deviceRecommendation.tier === "LOW") {
-      requested.premoveEnabled = false;
-      requested.showPremoveArrows = false;
-      requested.bulletTurboMode = false;
+    try {
+      await preferences.update(currentPlatform, requested, { source: "confirmation", presetId: requested.mobilePresetId });
+      setUiViewMode(lastInGameSubMode);
+      setPresetStatus("Автоход включён после явного подтверждения.", "#ffbe0b");
+      vibrate(24);
+    } catch (error) {
+      setPresetStatus("Автоматика не сохранена: " + compactText(error?.message, 120), "#ff7b9f");
     }
-    ok = setCheckbox("cc-premove-chk", requested.premoveEnabled, false) && ok;
-    ok = setCheckbox("cc-premove-arrows-chk", requested.showPremoveArrows, false) && ok;
-    ok = setCheckbox("cc-bullet-turbo-chk", requested.bulletTurboMode, false) && ok;
-    const auto = mainHudShadow.getElementById("cc-auto-master-chk");
-    if (!ok || !auto?.checked) {
-      setPresetStatus("Автоматика не включена: core UI отклонил изменение.", "#ff7b9f");
-      return;
-    }
-    const saved = await savePlatformPatch(requested);
-    setPresetStatus(
-      saved ? "Автоход включён после явного подтверждения." : "Автоход включён только для текущей сессии: storage недоступен.",
-      "#ffbe0b"
-    );
-    vibrate(24);
-  }
-
-  function installCalibrationMarker(root) {
-    const markManualChange = (event) => {
-      if (!event.isTrusted) return;
-      const target = event.target;
-      if (target?.id && ENGINE_CONTROL_IDS.has(target.id)) {
-        void saveGlobalPatch({ [calibrationKey]: true });
-      }
-    };
-    listen(root, "change", markManualChange, true);
-    listen(root, "input", markManualChange, true);
   }
 
   function enforceLowTierRestrictions() {
     if (!mainHudShadow) return;
-    const ids = ["cc-premove-chk", "cc-premove-arrows-chk", "cc-vis-phonk-chk", "cc-audio-radar-chk", "cc-heatmap-always-chk"];
+    for (const id of ["cc-bullet-turbo-chk", "cc-premove-chk", "cc-premove-arrows-chk"]) {
+      const control = mainHudShadow.getElementById(id);
+      if (control?.dataset.ccLowDisabled !== "1") continue;
+      control.disabled = false;
+      control.removeAttribute("aria-disabled");
+      control.removeAttribute("title");
+      delete control.dataset.ccLowDisabled;
+    }
+    const ids = ["cc-vis-phonk-chk", "cc-audio-radar-chk", "cc-heatmap-always-chk"];
     if (deviceRecommendation.tier !== "LOW") {
       for (const id of ids) {
         const control = mainHudShadow.getElementById(id);
@@ -1384,40 +1240,14 @@
       }
       return;
     }
-    let changed = false;
     for (const id of ids) {
       const control = mainHudShadow.getElementById(id);
       if (!control) continue;
-      if (control.checked) {
-        control.checked = false;
-        dispatchInput(control, "change");
-        changed = true;
-      }
       if (!control.disabled) control.dataset.ccLowDisabled = "1";
       control.disabled = true;
       control.setAttribute("aria-disabled", "true");
-      control.title = "Отключено профилем LOW для стабильной работы устройства";
+      control.title = "Временно приостановлено профилем LOW. Ваш выбор сохранён.";
     }
-    if (changed) {
-      void savePlatformPatch({
-        premoveEnabled: false,
-        showPremoveArrows: false,
-        phonkEditEnabled: false,
-        audioRadarEnabled: false,
-        heatmapAlwaysOn: false,
-        mobileAnimations: false,
-        mobileVisualEffects: false
-      });
-    }
-  }
-
-  function enforceInitialAutomationDefault() {
-    if (!storageReady || !forceAutomationOffOnBoot || !mainHudShadow) return;
-    setCheckbox("cc-auto-master-chk", false, false);
-    setCheckbox("cc-premove-chk", false, false);
-    setCheckbox("cc-premove-arrows-chk", false, false);
-    setCheckbox("cc-bullet-turbo-chk", false, false);
-    forceAutomationOffOnBoot = false;
   }
 
   const SURVEY_STEPS = Object.freeze([
@@ -1656,24 +1486,9 @@
   function suspendAutomation(reason) {
     pendingAutomation = null;
     setOverlayPassthrough(false);
-    if (!mainHudShadow) return;
-    const auto = mainHudShadow.getElementById("cc-auto-master-chk");
-    const premove = mainHudShadow.getElementById("cc-premove-chk");
-    let changed = false;
-    if (auto?.checked) {
-      auto.checked = false;
-      dispatchInput(auto, "change");
-      changed = true;
-    }
-    if (premove?.checked) {
-      premove.checked = false;
-      dispatchInput(premove, "change");
-      changed = true;
-    }
     window.dispatchEvent(new CustomEvent("cc-mobile-lifecycle", {
       detail: { state: reason, cancelPendingMoves: true }
     }));
-    if (changed) void savePlatformPatch({ autoMoveEnabled: false, premoveEnabled: false, showPremoveArrows: false });
   }
 
   function handleVisibilityChange() {
@@ -1773,7 +1588,6 @@
     return true;
   }
 
-  void storageRemove(["cc_custom_script_files", "lichess.cc_custom_script_files", "chesscom.cc_custom_script_files"]);
   function disablePublicScriptApi() {
     if (window.CC && typeof window.CC.loadScriptFile === "function") {
       window.CC.loadScriptFile = async () => false;
@@ -1786,7 +1600,11 @@
   schedule(disablePublicScriptApi, 0);
   startHudDiscovery();
   listen(document, "visibilitychange", handleVisibilityChange);
-  listen(window, "pagehide", () => cleanup("pagehide"), { once: true });
+  listen(window, "pagehide", event => {
+    if (!event.persisted) cleanup("pagehide");
+    else { suspendAutomation("pagehide"); clearScheduledWork(); stopHudDiscovery(); }
+  });
+  listen(window, "pageshow", event => { if (event.persisted) handleVisibilityChange(); });
   listen(window, "orientationchange", () => { fitSettingsViewport(); clampMiniHud(true); });
   listen(window, "resize", () => { fitSettingsViewport(); clampMiniHud(false); });
   listen(window.visualViewport, "resize", () => { fitSettingsViewport(); clampMiniHud(false); });
@@ -1804,8 +1622,7 @@
     applySavedMiniPosition();
     syncVisibilityStates();
     if (rootSetupComplete && mainHudShadow) activateMobileTab(mainHudShadow, initialStorage.cc_mobile_settings_tab || "presets");
-    enforceInitialAutomationDefault();
     if (rootSetupComplete && deviceRecommendation.tier === "LOW") enforceLowTierRestrictions();
     maybeStartWelcomeSequence();
-  });
+  }).catch(error => setPresetStatus("Настройки не восстановлены: " + compactText(error?.message, 120), "#ff7b9f"));
 })();

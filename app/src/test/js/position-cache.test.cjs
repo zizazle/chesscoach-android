@@ -22,6 +22,7 @@ function createHarness(file) {
   vm.runInContext(`
     const calls = { cancel:0, clear:0, hide:0, render:0, capture:0, retry:0, canvas:0 };
     const window = { __CC_ANDROID_RUNTIME__:{}, __CHESSCOACH_BOARD_STATE__:{} };
+    const mobileSession = null;
     const StockfishWasmEngine = { cancel() { calls.cancel++; } };
     let boardDirty = false, positionId = 4, positionAnalysisId = 7, analysisRequestId = 9;
     let currentPositionKey = initialKey, analysisSessionId = "session";

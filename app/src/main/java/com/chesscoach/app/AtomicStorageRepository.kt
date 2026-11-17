@@ -23,47 +23,64 @@ internal class AtomicStorageRepository(context: Context) {
                 migrateLegacyLocked()
             }
             if (!atomicFile.baseFile.exists()) {
-                writeLocked(JSONObject())
+                writeLocked(RevisionedStorageRecord.decode(JSONObject()))
             }
         }
     }
 
     fun snapshot(): JSONObject = synchronized(lock) {
-        cloneObject(readLocked())
+        cloneObject(readLocked().items)
+    }
+
+    fun revision(): Long = synchronized(lock) { readLocked().revision }
+
+    fun state(): JSONObject = synchronized(lock) { readLocked().response() }
+
+    fun patch(baseRevision: Long, mutationId: String, values: JSONObject, keys: List<String>, clear: Boolean): JSONObject = synchronized(lock) {
+        require(values.length() + keys.size <= MAX_MUTATION_KEYS) { "Too many storage mutation keys" }
+        validateTopLevel(values, MAX_MUTATION_KEYS)
+        keys.forEach(::validateKey)
+        val current = readLocked()
+        val updated = current.patch(baseRevision, mutationId, values, keys, clear)
+        validateTopLevel(updated.items, MAX_KEYS)
+        if (updated !== current) writeLocked(updated)
+        updated.response()
     }
 
     fun set(values: JSONObject): JSONObject = synchronized(lock) {
         validateTopLevel(values, MAX_MUTATION_KEYS)
-        val current = readLocked()
+        val record = readLocked()
+        val current = cloneObject(record.items)
         val names = values.keys()
         while (names.hasNext()) {
             val key = names.next()
             current.put(key, cloneJsonValue(values.get(key)))
         }
         validateTopLevel(current, MAX_KEYS)
-        writeLocked(current)
+        writeLocked(record.replacing(current))
         cloneObject(current)
     }
 
     fun remove(keys: List<String>): JSONObject = synchronized(lock) {
         require(keys.size <= MAX_MUTATION_KEYS) { "Too many storage keys" }
         keys.forEach(::validateKey)
-        val current = readLocked()
+        val record = readLocked()
+        val current = cloneObject(record.items)
         keys.forEach(current::remove)
-        writeLocked(current)
+        writeLocked(record.replacing(current))
         cloneObject(current)
     }
 
     fun clear(): JSONObject = synchronized(lock) {
         val empty = JSONObject()
-        writeLocked(empty)
+        writeLocked(readLocked().replacing(empty))
         empty
     }
 
     fun replace(values: JSONObject): JSONObject = synchronized(lock) {
         validateTopLevel(values, MAX_KEYS)
         val replacement = cloneObject(values)
-        writeLocked(replacement)
+        writeLocked(readLocked().replacing(replacement))
         cloneObject(replacement)
     }
 
@@ -79,22 +96,23 @@ internal class AtomicStorageRepository(context: Context) {
                 null
             }
             if (migrated != null) {
-                writeLocked(migrated)
+                writeLocked(RevisionedStorageRecord.decode(migrated))
                 legacy.delete()
                 return
             }
         }
     }
 
-    private fun readLocked(): JSONObject {
-        if (!atomicFile.baseFile.exists()) return JSONObject()
+    private fun readLocked(): RevisionedStorageRecord {
+        if (!atomicFile.baseFile.exists()) return RevisionedStorageRecord.decode(JSONObject())
         return try {
             val bytes = atomicFile.openRead().use { readBounded(it::read) }
             val parsed = JSONObject(String(bytes, StandardCharsets.UTF_8))
-            validateTopLevel(parsed, MAX_KEYS)
-            parsed
-        } catch (_: Exception) {
-            JSONObject()
+            val record = RevisionedStorageRecord.decode(parsed)
+            validateTopLevel(record.items, MAX_KEYS)
+            record
+        } catch (error: Exception) {
+            throw StorageOperationException("STORAGE_READ_FAILED", "Stored preferences could not be read; refusing to replace them with defaults")
         }
     }
 
@@ -106,16 +124,16 @@ internal class AtomicStorageRepository(context: Context) {
             val read = reader(buffer, 0, buffer.size)
             if (read < 0) break
             total += read
-            require(total <= MAX_STORAGE_BYTES) { "Storage exceeds limit" }
+            require(total <= MAX_STORAGE_BYTES + 16 * 1024) { "Storage exceeds limit" }
             output.write(buffer, 0, read)
         }
         return output.toByteArray()
     }
 
-    private fun writeLocked(value: JSONObject) {
-        validateTopLevel(value, MAX_KEYS)
-        val bytes = value.toString().toByteArray(StandardCharsets.UTF_8)
-        require(bytes.size <= MAX_STORAGE_BYTES) { "Storage exceeds limit" }
+    private fun writeLocked(value: RevisionedStorageRecord) {
+        validateTopLevel(value.items, MAX_KEYS)
+        val bytes = value.encode().toString().toByteArray(StandardCharsets.UTF_8)
+        require(bytes.size <= MAX_STORAGE_BYTES + 16 * 1024) { "Storage exceeds limit" }
 
         var stream: FileOutputStream? = null
         try {

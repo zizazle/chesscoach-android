@@ -15,7 +15,7 @@ const chromePath = process.env.CC_BROWSER_CHROME || (process.platform === "win32
 const tempParent = process.env.CC_BROWSER_TEMP || os.tmpdir();
 const takeScreenshots = process.argv.includes("--screenshots");
 const viewports = [[320, 568], [360, 640], [390, 844], [412, 915], [640, 360], [768, 1024], [360, 300]];
-const assetNames = ["content/content.css", "bridge/cc-mobile-launcher-orb.js", "content/content.js", "content/chesscom.js", "lib/openings.js", "lib/privacy-mask.js"];
+const assetNames = ["content/content.css", "bridge/cc-mobile-preferences.js", "bridge/cc-mobile-launcher-orb.js", "content/content.js", "content/chesscom.js", "lib/openings.js", "lib/privacy-mask.js"];
 const expectedLabels = ["\u041d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438", "\u0410\u043d\u0430\u043b\u0438\u0437", "\u0410\u0432\u0442\u043e\u0445\u043e\u0434", "\u0414\u0432\u0438\u0436\u043e\u043a", "\u0415\u0449\u0451"];
 const searchTerm = "\u0437\u0430\u0434\u0435\u0440\u0436\u043a\u0430";
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -140,7 +140,8 @@ function installMocks() {
   window.__CC_DEVICE_PROFILE__ = profile;
   window.__CC_ANDROID_BOOTSTRAP__ = { profile };
   window.__CC_ANDROID_RUNTIME__ = {
-    profile,
+    profile, chrome: window.chrome, ready: Promise.resolve(), disposed: false,
+    refreshStorage: () => Promise.resolve(), flushStorage: () => Promise.resolve(),
     nativeRequest(method, params) {
       harness.nativeCalls.push({ method, params: structuredClone(params) });
       if (method.startsWith("input.")) return Promise.reject(new Error("Board gestures are disabled in this fixture"));
@@ -274,7 +275,7 @@ async function run() {
       } else if (url.pathname === "/fixture") {
         const chesscom = request.headers.host.startsWith("chess.com.test:");
         response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-        response.end(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Isolated mobile menu regression</title><style>html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#202c35}#fixture-board{position:fixed;inset:0;background:repeating-conic-gradient(#718472 0% 25%,#d6dfc9 0% 50%) 0 0/80px 80px}</style></head><body><div id="fixture-board"></div><script src="/assets/lib/openings.js"></script>${chesscom ? '<script src="/assets/lib/privacy-mask.js"></script>' : ""}<script src="/assets/bridge/cc-mobile-launcher-orb.js"></script><script src="/assets/content/${chesscom ? "chesscom.js" : "content.js"}"></script></body></html>`);
+        response.end(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Isolated mobile menu regression</title><style>html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#202c35}#fixture-board{position:fixed;inset:0;background:repeating-conic-gradient(#718472 0% 25%,#d6dfc9 0% 50%) 0 0/80px 80px}</style></head><body><div id="fixture-board"></div><script src="/assets/lib/openings.js"></script>${chesscom ? '<script src="/assets/lib/privacy-mask.js"></script>' : ""}<script src="/assets/bridge/cc-mobile-preferences.js"></script><script src="/assets/bridge/cc-mobile-launcher-orb.js"></script><script src="/assets/content/${chesscom ? "chesscom.js" : "content.js"}"></script></body></html>`);
       } else {
         response.writeHead(404); response.end();
       }
@@ -356,7 +357,7 @@ async function run() {
         try {
           await send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: true });
           await send("Page.navigate", { url: `http://${host}:${port}/fixture` });
-          await waitFor(() => Boolean(window.__browserHarness?.root?.getElementById("cc-pane-more") && window.__browserHarness.root.querySelector("link")?.sheet));
+          await waitFor(() => Boolean(window.__CC_MOBILE_PREFERENCES__?.isReady && window.__browserHarness?.root?.getElementById("cc-pane-more") && window.__browserHarness.root.querySelector("link")?.sheet));
           await delay(90);
           geometry = await current();
           check("five primary labels", JSON.stringify(geometry.buttons.map(button => button.label)) === JSON.stringify(expectedLabels), geometry.buttons, context);
@@ -383,6 +384,10 @@ async function run() {
           await navTap("automove");
           const beforeSwitch = await evaluate(() => window.__browserHarness.root.getElementById("cc-auto-master-chk").checked);
           await tap("#cc-auto-master-chk", false, true);
+          await waitFor(() => {
+            const activePlatform = location.hostname.includes("chess.com") ? "chesscom" : "lichess";
+            return window.__browserHarness.store[`${activePlatform}.autoMoveEnabled`] === window.__browserHarness.root.getElementById("cc-auto-master-chk").checked;
+          });
           const afterSwitch = await evaluate(() => ({ checked: window.__browserHarness.root.getElementById("cc-auto-master-chk").checked, aria: window.__browserHarness.root.getElementById("cc-auto-master-chk").getAttribute("aria-label"), store: window.__browserHarness.store, changes: window.__browserHarness.changes.slice(-3) }));
           check("touching switch label toggles and invokes core binding", afterSwitch.checked !== beforeSwitch && afterSwitch.store[`${platform}.autoMoveEnabled`] === afterSwitch.checked && Boolean(afterSwitch.aria), afterSwitch, context);
           await tap("#cc-toggle-btn");

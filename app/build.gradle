@@ -35,8 +35,8 @@ android {
         applicationId = 'com.chesscoach.rework'
         minSdk = 26
         targetSdk = 36
-        versionCode = 1590
-        versionName = '15.9.0-Mobile'
+        versionCode = 1603
+        versionName = '16.0.3-Mobile'
     }
 
     signingConfigs {

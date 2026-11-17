@@ -40,8 +40,28 @@ internal object BridgeProtocol {
         val points: List<TouchPoint>,
         val durationMs: Int,
         val viewport: TouchViewport,
-        val documentToken: String
+        val documentToken: String,
+        val documentNonce: String,
+        val targetId: String,
+        val snapshot: InputSnapshot
     )
+
+    data class InputRect(val left: Double, val top: Double, val width: Double, val height: Double)
+
+    data class InputSnapshot(
+        val boardId: String,
+        val positionKey: String,
+        val orientation: String,
+        val myColor: String,
+        val turn: String,
+        val boardRect: InputRect,
+        val targetId: String,
+        val targetRect: InputRect,
+        val hit: Boolean,
+        val animating: Boolean
+    )
+
+    data class TouchCancellation(val requestId: String, val documentToken: String, val documentNonce: String?)
 
     fun parse(raw: String, maxBytes: Int = MAX_MESSAGE_BYTES): Message {
         require(raw.toByteArray(StandardCharsets.UTF_8).size <= maxBytes) { "Message exceeds limit" }
@@ -116,12 +136,15 @@ internal object BridgeProtocol {
     }
 
     fun validateTouchGesture(payload: JSONObject): TouchGesture {
-        requireOnlyKeys(payload, setOf("action", "points", "durationMs", "viewport", "documentToken"))
+        requireOnlyKeys(payload, setOf("action", "points", "durationMs", "viewport", "documentToken", "documentNonce", "targetId", "snapshot"))
         val action = payload.opt("action") as? String ?: throw IllegalArgumentException("Touch action is required")
         require(action == "tap" || action == "drag") { "Touch action must be tap or drag" }
-        val documentToken = payload.opt("documentToken") as? String
-            ?: throw IllegalArgumentException("Touch document token is required")
-        require(idPattern.matches(documentToken)) { "Invalid touch document token" }
+        val documentToken = inputId(payload, "documentToken")
+        val documentNonce = inputId(payload, "documentNonce")
+        val targetId = inputId(payload, "targetId")
+        val snapshot = validateInputSnapshot(payload.optJSONObject("snapshot")
+            ?: throw IllegalArgumentException("Input snapshot is required"))
+        require(snapshot.targetId == targetId) { "Input target identity differs" }
         val duration = payload.opt("durationMs")
         val minimumDuration = if (action == "tap") 40 else 80
         val maximumDuration = if (action == "tap") 200 else MAX_TOUCH_DURATION_MS
@@ -141,7 +164,49 @@ internal object BridgeProtocol {
             }
         }
         if (action == "drag") require(points.first() != points.last()) { "Drag endpoints must differ" }
-        return TouchGesture(action, points, (duration as Number).toInt(), viewport, documentToken)
+        return TouchGesture(action, points, (duration as Number).toInt(), viewport, documentToken, documentNonce, targetId, snapshot)
+    }
+
+    fun validateTouchCancellation(payload: JSONObject): TouchCancellation {
+        requireOnlyKeys(payload, setOf("requestId", "documentToken", "documentNonce"))
+        val nonce = if (payload.isNull("documentNonce")) null else inputId(payload, "documentNonce")
+        return TouchCancellation(inputId(payload, "requestId"), inputId(payload, "documentToken"), nonce)
+    }
+
+    fun validateInputContextRequest(payload: JSONObject): String {
+        requireOnlyKeys(payload, setOf("documentToken"))
+        return inputId(payload, "documentToken")
+    }
+
+    fun validateInputSnapshot(value: JSONObject): InputSnapshot {
+        requireOnlyKeys(value, setOf("v", "boardId", "positionKey", "orientation", "myColor", "turn", "boardRect", "targetId", "targetRect", "hit", "animating"))
+        require(integerInRange(value.opt("v"), 1, 1)) { "Unsupported input snapshot version" }
+        val key = value.opt("positionKey") as? String ?: throw IllegalArgumentException("Input position key is required")
+        require(key.length in 1..1024 && key.none { it.code < 32 || it.code == 127 }) { "Invalid input position key" }
+        val orientation = value.optString("orientation")
+        require(orientation == "white" || orientation == "black") { "Invalid input orientation" }
+        val color = value.optString("myColor")
+        val turn = value.optString("turn")
+        require(color in setOf("w", "b") && turn in setOf("w", "b")) { "Invalid input turn or color" }
+        require(value.opt("hit") is Boolean && value.opt("animating") is Boolean) { "Input snapshot flags must be boolean" }
+        return InputSnapshot(inputId(value, "boardId"), key, orientation, color, turn,
+            validateInputRect(value.getJSONObject("boardRect")), inputId(value, "targetId"),
+            validateInputRect(value.getJSONObject("targetRect")), value.getBoolean("hit"), value.getBoolean("animating"))
+    }
+
+    private fun validateInputRect(value: JSONObject): InputRect {
+        requireOnlyKeys(value, setOf("left", "top", "width", "height"))
+        val rect = InputRect(finiteNumber(value.opt("left")), finiteNumber(value.opt("top")),
+            finiteNumber(value.opt("width")), finiteNumber(value.opt("height")))
+        require(rect.left in -16384.0..16384.0 && rect.top in -16384.0..16384.0 &&
+            rect.width in 1.0..16384.0 && rect.height in 1.0..16384.0) { "Invalid input rectangle" }
+        return rect
+    }
+
+    private fun inputId(value: JSONObject, name: String): String {
+        val id = value.opt(name) as? String ?: throw IllegalArgumentException("Input $name is required")
+        require(idPattern.matches(id)) { "Invalid input $name" }
+        return id
     }
 
     fun validateTouchViewport(value: JSONObject): TouchViewport {

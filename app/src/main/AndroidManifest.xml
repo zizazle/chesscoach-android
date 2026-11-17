@@ -9,7 +9,7 @@
         android:fullBackupContent="@xml/backup_rules"
         android:hardwareAccelerated="true"
         android:icon="@drawable/ic_launcher"
-        android:label="ChessCoach 15.9.0"
+        android:label="ChessCoach 16.0.3"
         android:roundIcon="@drawable/ic_launcher"
         android:supportsRtl="true"
         android:usesCleartextTraffic="false"
@@ -24,6 +24,21 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter android:autoVerify="false">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="chess.com" />
+                <data android:scheme="https" android:host="www.chess.com" />
+                <data android:scheme="https" android:host="link.chess.com" />
+                <data android:scheme="https" android:host="links.chess.com" />
+                <data android:scheme="https" android:host="click.chess.com" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
             </intent-filter>
         </activity>
 

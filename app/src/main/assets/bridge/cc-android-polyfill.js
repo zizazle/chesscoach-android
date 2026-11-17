@@ -20,7 +20,8 @@
   const MAX_STORAGE_ARRAY_ITEMS = 256;
   const MAX_STORAGE_STRING_BYTES = 32 * 1024;
   const MAX_TOUCH_POINTS = 16;
-  const INPUT_TIMEOUT_MS = 3000;
+  const INPUT_TIMEOUT_MS = 5500;
+  const INPUT_CONTEXT_TIMEOUT_MS = 4500;
   const FORBIDDEN_KEYS = new Set(["__proto__", "prototype", "constructor"]);
   const NO_RECEIVER_MESSAGE = "Could not establish connection. Receiving end does not exist.";
 
@@ -220,10 +221,19 @@
   let storageFlushFailures = 0;
   let storageFlushInFlight = false;
   let storageDirty = false;
+  let storageHydrated = false;
+  let storageReadyPromise = null;
+  let storageRefreshPromise = null;
+  let activeStoragePatch = null;
+  const storageFlushWaiters = [];
   const pendingRequests = new Map();
   const storageChanged = createEvent();
   const nativeEvents = createEvent();
   const inputDocumentToken = nextRequestId("input-doc");
+  let inputDocumentNonce = null;
+  let inputContext = null;
+  let inputContextRequest = null;
+  let inputSnapshotProvider = null;
 
   function runtimeId() {
     const candidate = profileState && profileState.runtimeId;
@@ -363,22 +373,20 @@
 
   function mergeStoragePatch(clear, setValues, removedKeys, changes, resolve, reject) {
     storageDirty = true;
-    const baseRevision = storageRevision;
-    storageRevision++;
     if (!pendingStoragePatch) {
       pendingStoragePatch = {
-        baseRevision,
-        revision: storageRevision,
         clear: false,
         set: Object.create(null),
         remove: new Set(),
         waiters: [],
-        events: []
+        events: [],
+        operations: null,
+        index: 0,
+        settled: false
       };
     }
     pendingStoragePatch.waiters.push({ resolve, reject });
     pendingStoragePatch.events.push(cloneForPublic(changes));
-    pendingStoragePatch.revision = storageRevision;
     if (clear) {
       pendingStoragePatch.clear = true;
       pendingStoragePatch.set = Object.create(null);
@@ -396,7 +404,7 @@
   }
 
   function scheduleStorageFlush(delay = STORAGE_FLUSH_MS) {
-    if (disposed || storageFlushInFlight || storageFlushTimer !== null || !pendingStoragePatch) return;
+    if (disposed || storageFlushInFlight || storageFlushTimer !== null || (!activeStoragePatch && !pendingStoragePatch)) return;
     storageFlushTimer = setTimeout(() => {
       storageFlushTimer = null;
       flushStoragePatch();
@@ -437,9 +445,21 @@
   function flushStorageSnapshotBeforeUnload() {
     if (disposed || !storageDirty || !getNativeBridge()) return false;
     try {
-      postStorageOperationUntracked("storage.replace", { items: copyStorageRecord(storageState) });
-      storageDirty = false;
-      return true;
+      let revision = storageRevision;
+      let posted = false;
+      for (const patch of [activeStoragePatch, pendingStoragePatch]) {
+        if (!patch) continue;
+        for (const operation of storageOperationsForPatch(patch).slice(patch.index)) {
+          const baseRevision = operation.sentRevision ?? revision;
+          if (!operation.unloadPosted) {
+            postStorageOperationUntracked("storage.patch", storageOperationPayload(operation, baseRevision));
+            operation.unloadPosted = true;
+            posted = true;
+          }
+          revision = Math.max(revision, baseRevision) + 1;
+        }
+      }
+      return posted;
     } catch (error) {
       nativeEvents.emit(() => [{ name: "bridge.error", data: { channel: "storage", message: error.message } }]);
       return false;
@@ -447,58 +467,161 @@
   }
 
   function storageOperationsForPatch(patch) {
-    return [["storage.replace", { items: copyStorageRecord(storageState) }]];
+    if (patch.operations) return patch.operations;
+    const criticalKeys = Object.hasOwn(patch.set, "cc_mobile_settings_schema")
+      ? new Set(["cc_mobile_settings_schema", "lichess.safeAntiBanGuard", "chesscom.safeAntiBanGuard", "lichess.mobilePresetId", "chesscom.mobilePresetId"])
+      : new Set();
+    const critical = [];
+    const entries = [];
+    for (const [key, value] of Object.entries(patch.set)) {
+      (criticalKeys.has(key) ? critical : entries).push({ key, value, remove: false });
+    }
+    for (const key of patch.remove) entries.push({ key, remove: true });
+    const chunks = chunkEntries(entries, MAX_STORAGE_MUTATION_KEYS);
+    if (critical.length) {
+      if (chunks.length && chunks[chunks.length - 1].length + critical.length <= MAX_STORAGE_MUTATION_KEYS) chunks[chunks.length - 1].push(...critical);
+      else chunks.push(critical);
+    }
+    if (!chunks.length) chunks.push([]);
+    patch.operations = chunks.map((chunk, index) => ({
+      mutationId: nextRequestId("storage-mutation"), clear: patch.clear && index === 0,
+      items: createPublicRecord(chunk.filter(item => !item.remove).map(item => [item.key, item.value])),
+      keys: chunk.filter(item => item.remove).map(item => item.key), sentRevision: null, unloadPosted: false
+    }));
+    return patch.operations;
   }
 
-  function requeueStorageSnapshot(patch, error) {
+  function storageOperationPayload(operation, baseRevision) {
+    return { baseRevision, mutationId: operation.mutationId, items: operation.items, keys: operation.keys, clear: operation.clear };
+  }
+
+  function settleStoragePatch(patch, error) {
+    if (!patch || patch.settled) return;
+    patch.settled = true;
+    for (const waiter of patch.waiters) {
+      if (error) waiter.reject(error); else waiter.resolve();
+    }
+  }
+
+  function settleStorageFlush(error) {
+    if (!error && (activeStoragePatch || pendingStoragePatch)) return;
+    for (const waiter of storageFlushWaiters.splice(0)) {
+      if (error) waiter.reject(error); else waiter.resolve(resolveGet(null));
+    }
+  }
+
+  function disposeStorage(error) {
+    if (storageFlushTimer !== null) clearTimeout(storageFlushTimer);
+    storageFlushTimer = null;
+    settleStoragePatch(activeStoragePatch, error);
+    settleStoragePatch(pendingStoragePatch, error);
+    activeStoragePatch = null;
+    pendingStoragePatch = null;
+    settleStorageFlush(error);
+  }
+
+  function mergeStorageEvents(events) {
+    const result = {};
+    for (const changes of events) {
+      for (const [key, change] of Object.entries(changes)) {
+        if (!Object.hasOwn(result, key)) result[key] = Object.hasOwn(change, "oldValue") ? { oldValue: change.oldValue } : {};
+        if (Object.hasOwn(change, "newValue")) result[key].newValue = change.newValue;
+        else delete result[key].newValue;
+      }
+    }
+    for (const [key, change] of Object.entries(result)) {
+      if (Object.hasOwn(change, "oldValue") === Object.hasOwn(change, "newValue") &&
+        JSON.stringify(change.oldValue) === JSON.stringify(change.newValue)) delete result[key];
+    }
+    return result;
+  }
+
+  function requeueStoragePatch(patch, error) {
     storageFlushInFlight = false;
     storageFlushFailures++;
     nativeEvents.emit(() => [{ name: "bridge.error", data: { channel: "storage", message: error.message } }]);
     if (disposed || storageFlushFailures > 5) {
-      for (const waiter of patch.waiters) waiter.reject(error);
-      if (pendingStoragePatch) {
-        for (const waiter of pendingStoragePatch.waiters) waiter.reject(error);
-        pendingStoragePatch = null;
-      }
+      disposeStorage(error);
       storageFlushFailures = 0;
       return;
     }
-
-    const existing = pendingStoragePatch;
-    pendingStoragePatch = {
-      baseRevision: patch.baseRevision,
-      revision: storageRevision,
-      clear: true,
-      set: copyStorageRecord(storageState),
-      remove: new Set(),
-      waiters: [...patch.waiters, ...(existing?.waiters || [])],
-      events: [...patch.events, ...(existing?.events || [])]
-    };
-    scheduleStorageFlush(Math.min(1000, STORAGE_FLUSH_MS * (2 ** storageFlushFailures)));
+    const retry = () => scheduleStorageFlush(Math.min(1000, STORAGE_FLUSH_MS * (2 ** storageFlushFailures)));
+    if (error.code === "STORAGE_REVISION_CONFLICT") refreshStorage().then(retry, refreshError => requeueStoragePatch(patch, refreshError));
+    else retry();
   }
 
   function flushStoragePatch() {
-    if (disposed || storageFlushInFlight || !pendingStoragePatch) return false;
+    if (disposed || storageFlushInFlight || (!activeStoragePatch && !pendingStoragePatch)) return false;
     if (storageFlushTimer !== null) {
       clearTimeout(storageFlushTimer);
       storageFlushTimer = null;
     }
-    const patch = pendingStoragePatch;
-    pendingStoragePatch = null;
+    const patch = activeStoragePatch || pendingStoragePatch;
+    if (!activeStoragePatch) pendingStoragePatch = null;
+    activeStoragePatch = patch;
     storageFlushInFlight = true;
-    let sequence = Promise.resolve();
-    for (const [type, payload] of storageOperationsForPatch(patch)) {
-      sequence = sequence.then(() => sendStorageOperation(type, payload));
-    }
+    const sequence = (async () => {
+      const operations = storageOperationsForPatch(patch);
+      while (patch.index < operations.length) {
+        const operation = operations[patch.index];
+        operation.sentRevision = storageRevision;
+        const response = await sendStorageOperation("storage.patch", storageOperationPayload(operation, storageRevision));
+        applyNativeStorageSnapshot(response);
+        patch.index++;
+      }
+    })();
     sequence.then(() => {
       storageFlushInFlight = false;
       storageFlushFailures = 0;
-      for (const changes of patch.events) emitStorageChanges(changes);
-      for (const waiter of patch.waiters) waiter.resolve();
+      if (disposed) return;
+      activeStoragePatch = null;
+      emitStorageChanges(mergeStorageEvents(patch.events));
+      settleStoragePatch(patch);
       if (!pendingStoragePatch) storageDirty = false;
-      scheduleStorageFlush();
-    }, error => requeueStorageSnapshot(patch, error));
+      settleStorageFlush();
+      scheduleStorageFlush(storageFlushWaiters.length ? 0 : STORAGE_FLUSH_MS);
+    }, error => requeueStoragePatch(patch, error));
     return true;
+  }
+
+  function refreshStorage() {
+    if (disposed) return Promise.reject(createError("Android runtime is disposed", "CONTEXT_INVALIDATED"));
+    if (!storageRefreshPromise) {
+      storageRefreshPromise = sendStorageOperation("storage.get", {}).then(response => {
+        if (disposed) throw createError("Android runtime is disposed", "CONTEXT_INVALIDATED");
+        applyNativeStorageSnapshot(response);
+        storageHydrated = true;
+        return resolveGet(null);
+      }).finally(() => { storageRefreshPromise = null; });
+    }
+    return storageRefreshPromise;
+  }
+
+  function ensureStorageReady() {
+    if (disposed) return Promise.reject(createError("Android runtime is disposed", "CONTEXT_INVALIDATED"));
+    if (storageHydrated) return Promise.resolve(resolveGet(null));
+    if (!storageReadyPromise) {
+      storageReadyPromise = refreshStorage();
+      storageReadyPromise.catch(() => { storageReadyPromise = null; });
+    }
+    return storageReadyPromise;
+  }
+
+  function storageCall(callback, operation) {
+    return callbackOrPromise(callback, (resolve, reject) => {
+      ensureStorageReady().then(() => {
+        if (disposed) throw createError("Android runtime is disposed", "CONTEXT_INVALIDATED");
+        operation(resolve, reject);
+      }).catch(reject);
+    });
+  }
+
+  async function flushStorage() {
+    await ensureStorageReady();
+    if (!activeStoragePatch && !pendingStoragePatch) return resolveGet(null);
+    const result = new Promise((resolve, reject) => storageFlushWaiters.push({ resolve, reject }));
+    flushStoragePatch();
+    return result;
   }
 
   const storageLocal = Object.freeze({
@@ -508,10 +631,10 @@
         callback = keys;
         keys = null;
       }
-      return callbackOrPromise(callback, resolve => resolve(resolveGet(keys)));
+      return storageCall(callback, resolve => resolve(resolveGet(keys)));
     },
     set(items, callback) {
-      return callbackOrPromise(callback, (resolve, reject) => {
+      return storageCall(callback, (resolve, reject) => {
         if (!isPlainObject(items)) throw createError("storage.local.set requires an object", "INVALID_ARGUMENT");
         if (!getNativeBridge()) throw createError("Android native bridge is unavailable", "NATIVE_BRIDGE_UNAVAILABLE");
         const candidate = copyStorageRecord(storageState);
@@ -540,7 +663,7 @@
       });
     },
     remove(keys, callback) {
-      return callbackOrPromise(callback, (resolve, reject) => {
+      return storageCall(callback, (resolve, reject) => {
         if (!getNativeBridge()) throw createError("Android native bridge is unavailable", "NATIVE_BRIDGE_UNAVAILABLE");
         const list = typeof keys === "string" ? [keys] : keys;
         if (!Array.isArray(list)) throw createError("storage.local.remove requires a string or array", "INVALID_ARGUMENT");
@@ -564,18 +687,14 @@
       });
     },
     clear(callback) {
-      return callbackOrPromise(callback, (resolve, reject) => {
+      return storageCall(callback, (resolve, reject) => {
         if (!getNativeBridge()) throw createError("Android native bridge is unavailable", "NATIVE_BRIDGE_UNAVAILABLE");
         const changes = {};
         for (const [key, value] of Object.entries(storageState)) {
           changes[key] = { oldValue: cloneForPublic(value) };
         }
         storageState = Object.create(null);
-        if (Object.keys(changes).length) {
-          mergeStoragePatch(true, {}, [], changes, resolve, reject);
-        } else {
-          resolve();
-        }
+        mergeStoragePatch(true, {}, [], changes, resolve, reject);
       });
     }
   });
@@ -617,10 +736,45 @@
     const message = noReceiver
       ? NO_RECEIVER_MESSAGE
       : String(raw?.message || payload?.message || "Android native request failed").slice(0, 1024);
-    return createError(message, noReceiver ? "NO_RECEIVER" : code);
+    const error = createError(message, noReceiver ? "NO_RECEIVER" : code);
+    if (typeof raw?.phase === "string" && /^[a-z-]{1,32}$/.test(raw.phase)) error.phase = raw.phase;
+    if (Number.isFinite(raw?.elapsedMs) && raw.elapsedMs >= 0 && raw.elapsedMs <= 120000) error.elapsedMs = raw.elapsedMs;
+    if (typeof raw?.hadDown === "boolean") error.hadDown = raw.hadDown;
+    return error;
   }
 
-  function beginRequest(channel, type, responseType, payload, timeoutMs, callback, target) {
+  function postScopedInputCancel(id, pending) {
+    if (pending.cancelSent || !pending.posted || pending.channel !== "input" ||
+        !["input.gesture", "input.context.get"].includes(pending.type)) return;
+    pending.cancelSent = true;
+    try {
+      postEnvelope({
+        v: PROTOCOL_VERSION, scope: PROTOCOL_SCOPE, source: "remote", target: "NATIVE", channel: "input",
+        type: "input.cancel", id: nextRequestId("cancel"),
+        payload: { requestId: id, documentToken: pending.payload.documentToken, documentNonce: pending.payload.documentNonce || null }
+      });
+    } catch (_) {}
+  }
+
+  function finishPendingRequest(id, error, value) {
+    const pending = pendingRequests.get(id);
+    if (!pending) return;
+    pendingRequests.delete(id);
+    clearTimeout(pending.timer);
+    if (pending.abortCleanup) { try { pending.abortCleanup(); } catch (_) {} }
+    if (error) {
+      error.requestId = id;
+      if (pending.channel === "input" && error.code === "INPUT_DOCUMENT_CHANGED") {
+        inputContext = null;
+        inputDocumentNonce = null;
+      }
+    }
+    if (pending.callback) invokeCallback(pending.callback, value, error);
+    else if (error) pending.reject(error);
+    else pending.resolve(value);
+  }
+
+  function beginRequest(channel, type, responseType, payload, timeoutMs, callback, target, options = {}) {
     const id = nextRequestId(channel === "runtime" ? "rt" : "native");
     const createEnvelope = () => ({
       v: PROTOCOL_VERSION,
@@ -633,39 +787,42 @@
       payload
     });
 
-    if (typeof callback === "function") {
+    const start = (resolve, reject) => {
+      const pending = { channel, type, responseType, payload, callback, resolve, reject, posted: false, cancelSent: false };
       const timer = setTimeout(() => {
-        const pending = pendingRequests.get(id);
-        if (!pending) return;
-        pendingRequests.delete(id);
-        invokeCallback(callback, undefined, createError(`Android ${channel} request timed out after ${timeoutMs} ms`, "TIMEOUT"));
+        if (pendingRequests.get(id) !== pending) return;
+        postScopedInputCancel(id, pending);
+        const error = createError(`Android ${channel} request timed out after ${timeoutMs} ms`, "TIMEOUT");
+        if (channel === "input") { error.phase = "reply"; error.deliveryUnknown = type === "input.gesture" && pending.posted; }
+        finishPendingRequest(id, error);
       }, timeoutMs);
-      pendingRequests.set(id, { channel, responseType, callback, timer });
+      pending.timer = timer;
+      pendingRequests.set(id, pending);
+      if (options.signal) {
+        const abort = () => {
+          if (pendingRequests.get(id) !== pending) return;
+          postScopedInputCancel(id, pending);
+          const error = createError("The native request was aborted", channel === "input" ? "INPUT_CANCELLED" : "REQUEST_ABORTED");
+          error.name = "AbortError";
+          finishPendingRequest(id, error);
+        };
+        pending.abortCleanup = () => options.signal.removeEventListener("abort", abort);
+        try { options.signal.addEventListener("abort", abort, { once: true }); }
+        catch (_) { finishPendingRequest(id, createError("Could not attach request cancellation", "INVALID_ARGUMENT")); return; }
+        if (options.signal.aborted) { abort(); return; }
+      }
       try {
+        pending.posted = true;
         postEnvelope(createEnvelope());
       } catch (error) {
-        clearTimeout(timer);
-        pendingRequests.delete(id);
-        invokeCallback(callback, undefined, error);
+        finishPendingRequest(id, error);
       }
+    };
+    if (typeof callback === "function") {
+      start();
       return undefined;
     }
-
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (!pendingRequests.has(id)) return;
-        pendingRequests.delete(id);
-        reject(createError(`Android ${channel} request timed out after ${timeoutMs} ms`, "TIMEOUT"));
-      }, timeoutMs);
-      pendingRequests.set(id, { channel, responseType, resolve, reject, timer });
-      try {
-        postEnvelope(createEnvelope());
-      } catch (error) {
-        clearTimeout(timer);
-        pendingRequests.delete(id);
-        reject(error);
-      }
-    });
+    return new Promise(start);
   }
 
   function sendRuntimeMessage(message, options, callback) {
@@ -714,6 +871,86 @@
     );
   }
 
+  function validateInputId(value) {
+    if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(value)) {
+      throw createError("Invalid input identity", "INVALID_INPUT");
+    }
+    return value;
+  }
+
+  function normalizeInputSnapshot(raw) {
+    const fields = ["v", "boardId", "positionKey", "orientation", "myColor", "turn", "boardRect", "targetId", "targetRect", "hit", "animating"];
+    if (!isPlainObject(raw) || Object.keys(raw).some(key => !fields.includes(key)) || raw.v !== 1 ||
+        typeof raw.positionKey !== "string" || raw.positionKey.length < 1 || raw.positionKey.length > 1024 || /[\0-\x1F\x7F]/.test(raw.positionKey) ||
+        !["white", "black"].includes(raw.orientation) || !["w", "b"].includes(raw.myColor) || !["w", "b"].includes(raw.turn) ||
+        typeof raw.hit !== "boolean" || typeof raw.animating !== "boolean") {
+      throw createError("Invalid mobile input snapshot", "INPUT_SNAPSHOT_INVALID");
+    }
+    const rect = value => {
+      if (!isPlainObject(value) || Object.keys(value).some(key => !["left", "top", "width", "height"].includes(key)) ||
+          ![value.left, value.top, value.width, value.height].every(number => typeof number === "number" && Number.isFinite(number)) ||
+          Math.abs(value.left) > 16384 || Math.abs(value.top) > 16384 || value.width < 1 || value.width > 16384 || value.height < 1 || value.height > 16384) {
+        throw createError("Invalid mobile input rectangle", "INPUT_SNAPSHOT_INVALID");
+      }
+      return { left: value.left, top: value.top, width: value.width, height: value.height };
+    };
+    return { v: 1, boardId: validateInputId(raw.boardId), positionKey: raw.positionKey, orientation: raw.orientation,
+      myColor: raw.myColor, turn: raw.turn, boardRect: rect(raw.boardRect), targetId: validateInputId(raw.targetId),
+      targetRect: rect(raw.targetRect), hit: raw.hit, animating: raw.animating };
+  }
+
+  function registerInputSnapshotProvider(provider) {
+    if (disposed) throw createError("Android runtime is disposed", "CONTEXT_INVALIDATED");
+    if (typeof provider !== "function") throw createError("Input snapshot provider must be a function", "INVALID_INPUT");
+    if (inputSnapshotProvider && inputSnapshotProvider !== provider) throw createError("An input snapshot provider is already registered", "INPUT_PROVIDER_EXISTS");
+    inputSnapshotProvider = provider;
+    return () => { if (inputSnapshotProvider === provider) inputSnapshotProvider = null; };
+  }
+
+  function captureInputSnapshot(request) {
+    if (disposed) throw createError("Android runtime is disposed", "CONTEXT_INVALIDATED");
+    if (!inputSnapshotProvider) throw createError("The mobile core input snapshot is unavailable", "INPUT_SNAPSHOT_UNAVAILABLE");
+    if (!isPlainObject(request) || Object.keys(request).some(key => !["points", "targetId"].includes(key)) ||
+        !Array.isArray(request.points) || request.points.length < 1 || request.points.length > MAX_TOUCH_POINTS) {
+      throw createError("Invalid input snapshot request", "INVALID_INPUT");
+    }
+    const targetId = validateInputId(request.targetId);
+    const points = request.points.map(point => {
+      if (!isPlainObject(point) || Object.keys(point).some(key => !["x", "y"].includes(key)) ||
+          ![point.x, point.y].every(value => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 32768)) {
+        throw createError("Invalid input snapshot point", "INVALID_INPUT");
+      }
+      return { x: point.x, y: point.y };
+    });
+    let raw;
+    try { raw = inputSnapshotProvider({ points, targetId }); }
+    catch (_) { throw createError("The live mobile input snapshot could not be captured", "INPUT_SNAPSHOT_UNAVAILABLE"); }
+    const snapshot = normalizeInputSnapshot(raw);
+    if (snapshot.targetId !== targetId) throw createError("Input snapshot target differs", "INPUT_SNAPSHOT_INVALID");
+    return freezeJson(snapshot);
+  }
+
+  function ensureInputContext(signal) {
+    if (!inputContextRequest && !inputContext) {
+      inputContextRequest = beginRequest("input", "input.context.get", "input.context.response", { documentToken: inputDocumentToken },
+        INPUT_CONTEXT_TIMEOUT_MS, undefined, "NATIVE").finally(() => { inputContextRequest = null; });
+    }
+    const ready = inputContext ? Promise.resolve(inputContext) : inputContextRequest;
+    if (!signal) return ready;
+    return new Promise((resolve, reject) => {
+      const abort = () => {
+        signal.removeEventListener("abort", abort);
+        const error = createError("The input action was aborted before dispatch", "INPUT_CANCELLED");
+        error.name = "AbortError";
+        reject(error);
+      };
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) abort();
+      ready.then(value => { signal.removeEventListener("abort", abort); if (!signal.aborted) resolve(value); },
+        error => { signal.removeEventListener("abort", abort); reject(error); });
+    });
+  }
+
   function normalizeNativeRequest(method, rawParams) {
     const params = rawParams === undefined ? {} : rawParams;
     if (!isPlainObject(params)) throw createError("Native request params must be an object", "INVALID_ARGUMENT");
@@ -721,18 +958,25 @@
       if (Object.keys(params).length) throw createError("Project page takes no params", "INVALID_ARGUMENT");
       return { channel: "project", type: "project.open", responseType: "project.open.response", payload: {} };
     }
+    if (method === "input.context.get") {
+      if (Object.keys(params).length || window !== window.top || document.visibilityState !== "visible") {
+        throw createError("Input context requires the visible main document and no params", "INVALID_INPUT");
+      }
+      return { channel: "input", type: method, responseType: "input.context.response", timeoutMs: INPUT_CONTEXT_TIMEOUT_MS,
+        payload: { documentToken: inputDocumentToken } };
+    }
     if (method === "input.cancel") {
-      if (Object.keys(params).length) throw createError("Input cancellation takes no params", "INVALID_INPUT");
+      if (Object.keys(params).some(key => !["requestId", "documentNonce"].includes(key))) throw createError("Unexpected input cancellation field", "INVALID_INPUT");
       return {
         channel: "input", type: "input.cancel", responseType: "input.cancel.response", timeoutMs: INPUT_TIMEOUT_MS,
-        payload: { documentToken: inputDocumentToken }
+        payload: { requestId: validateInputId(params.requestId), documentToken: inputDocumentToken, documentNonce: validateInputId(params.documentNonce) }
       };
     }
     if (method === "input.gesture") {
       if (window !== window.top || document.visibilityState !== "visible") {
         throw createError("Native input requires the visible main game document", "INPUT_UNAVAILABLE");
       }
-      if (Object.keys(params).some(key => !["action", "points", "durationMs", "viewport"].includes(key))) {
+      if (Object.keys(params).some(key => !["action", "points", "durationMs", "viewport", "targetId", "snapshot"].includes(key))) {
         throw createError("Unexpected input field", "INVALID_INPUT");
       }
       const action = params.action;
@@ -769,9 +1013,13 @@
       if (action === "drag" && points[0].x === points[points.length - 1].x && points[0].y === points[points.length - 1].y) {
         throw createError("Drag endpoints must differ", "INVALID_INPUT");
       }
+      const targetId = validateInputId(params.targetId);
+      const snapshot = params.snapshot === undefined ? captureInputSnapshot({ points, targetId }) : normalizeInputSnapshot(params.snapshot);
+      if (snapshot.targetId !== targetId) throw createError("Input snapshot target differs", "INPUT_SNAPSHOT_INVALID");
       return {
         channel: "input", type: "input.gesture", responseType: "input.gesture.response", timeoutMs: INPUT_TIMEOUT_MS,
-        payload: { action, points, durationMs, viewport: { ...viewport }, documentToken: inputDocumentToken }
+        payload: { action, points, durationMs, viewport: { ...viewport }, documentToken: inputDocumentToken,
+          documentNonce: inputDocumentNonce, targetId, snapshot }
       };
     }
     if (method === "platform" || method === "platform.switch") {
@@ -841,22 +1089,37 @@
     throw createError("Unsupported native request", "UNSUPPORTED_NATIVE_REQUEST");
   }
 
-  function nativeRequest(method, params, callback) {
+  function nativeRequest(method, params, options, callback) {
     if (typeof params === "function") {
       callback = params;
       params = undefined;
+      options = undefined;
     }
+    if (typeof options === "function") { callback = options; options = undefined; }
     try {
+      const requestOptions = options === undefined ? {} : options;
+      if (!isPlainObject(requestOptions) || Object.keys(requestOptions).some(key => key !== "signal") ||
+          (requestOptions.signal !== undefined && (!requestOptions.signal || typeof requestOptions.signal.aborted !== "boolean" ||
+            typeof requestOptions.signal.addEventListener !== "function" || typeof requestOptions.signal.removeEventListener !== "function"))) {
+        throw createError("Native request options must contain a valid AbortSignal", "INVALID_ARGUMENT");
+      }
+      if (disposed) throw createError("Android runtime is disposed", "CONTEXT_INVALIDATED");
+      if (requestOptions.signal?.aborted) throw createError("The native request was aborted", "INPUT_CANCELLED");
       const request = normalizeNativeRequest(method, params);
-      return beginRequest(
-        request.channel,
-        request.type,
-        request.responseType,
-        request.payload,
-        request.timeoutMs || NATIVE_TIMEOUT_MS,
-        callback,
-        "NATIVE"
-      );
+      const perform = async () => {
+        if (request.type === "input.gesture") {
+          const context = await ensureInputContext(requestOptions.signal);
+          request.payload.documentNonce = context.documentNonce;
+        }
+        return beginRequest(request.channel, request.type, request.responseType, request.payload,
+          request.timeoutMs || NATIVE_TIMEOUT_MS, undefined, "NATIVE", requestOptions);
+      };
+      const promise = perform();
+      if (typeof callback === "function") {
+        promise.then(value => invokeCallback(callback, value, null), error => invokeCallback(callback, undefined, error));
+        return undefined;
+      }
+      return promise;
     } catch (error) {
       if (typeof callback === "function") {
         invokeCallback(callback, undefined, error);
@@ -908,32 +1171,51 @@
       (envelope.type !== pending.responseType && envelope.type !== "error") ||
       envelope.channel !== (envelope.type === "error" ? "native" : "input")
     )) return false;
-    pendingRequests.delete(id);
-    clearTimeout(pending.timer);
     const ok = envelope.ok !== false && envelope.payload?.ok !== false && !envelope.error &&
       (pending.channel !== "input" || (envelope.type === pending.responseType && envelope.payload?.ok === true &&
-        (pending.responseType === "input.cancel.response" || envelope.payload?.dispatched === true)));
+        (["input.cancel.response", "input.context.response"].includes(pending.responseType) || envelope.payload?.dispatched === true)));
     const responsePayload = Object.prototype.hasOwnProperty.call(envelope, "result")
       ? envelope.result
       : Object.prototype.hasOwnProperty.call(envelope.payload || {}, "result")
         ? envelope.payload.result
         : envelope.payload;
     if (ok) {
-      const value = responsePayload === undefined ? undefined : cloneJson(responsePayload, MAX_RUNTIME_BYTES, "Native response");
-      if (pending.callback) invokeCallback(pending.callback, value, null);
-      else pending.resolve(value);
+      try {
+        const value = responsePayload === undefined ? undefined : cloneJson(responsePayload,
+          pending.channel === "storage" ? MAX_BRIDGE_BYTES : MAX_RUNTIME_BYTES, "Native response");
+        if (pending.responseType === "input.context.response") {
+          if (!isPlainObject(value) || value.documentToken !== inputDocumentToken ||
+              typeof value.documentNonce !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(value.documentNonce) ||
+              !Number.isSafeInteger(value.documentGeneration) || value.documentGeneration < 0 || value.origin !== location.origin) {
+            throw createError("Native document context is invalid", "INPUT_CONTEXT_INVALID");
+          }
+          inputContext = freezeJson(value);
+          inputDocumentNonce = value.documentNonce;
+        }
+        finishPendingRequest(id, null, value);
+      } catch (error) { finishPendingRequest(id, error); }
     } else {
       const error = normalizeBridgeError(envelope.payload || envelope, envelope.code);
-      if (pending.callback) invokeCallback(pending.callback, undefined, error);
-      else pending.reject(error);
+      finishPendingRequest(id, error);
     }
     return true;
   }
 
   function applyNativeStorageSnapshot(payload) {
-    if (!isPlainObject(payload?.storage)) return;
-    if (Number.isSafeInteger(payload.revision) && payload.revision < storageRevision) return;
-    const next = copyStorageRecord(payload.storage);
+    const items = payload?.items ?? payload?.storage;
+    if (!isPlainObject(items) || !Number.isSafeInteger(payload.revision) || payload.revision < 0) {
+      throw createError("Native storage snapshot is invalid", "INVALID_STORAGE_SNAPSHOT");
+    }
+    if (payload.revision < storageRevision) return;
+    let next = copyStorageRecord(items);
+    // A native refresh must not undo explicit edits still awaiting durable IO.
+    for (const patch of [activeStoragePatch, pendingStoragePatch]) {
+      if (!patch) continue;
+      if (patch.clear) next = Object.create(null);
+      Object.assign(next, copyStorageRecord(patch.set));
+      for (const key of patch.remove) delete next[key];
+    }
+    verifyStorageCandidate(next);
     const changes = {};
     const keys = new Set([...Object.keys(storageState), ...Object.keys(next)]);
     for (const key of keys) {
@@ -945,9 +1227,7 @@
       if (hasNew) changes[key].newValue = cloneForPublic(next[key]);
     }
     storageState = next;
-    if (Number.isSafeInteger(payload.revision) && payload.revision >= storageRevision) {
-      storageRevision = payload.revision;
-    }
+    storageRevision = payload.revision;
     emitStorageChanges(changes);
   }
 
@@ -970,6 +1250,7 @@
         envelope.type === "haptic.response" ||
         envelope.type === "download.response" ||
         envelope.type === "input.gesture.response" ||
+        envelope.type === "input.context.response" ||
         envelope.type === "input.cancel.response" ||
         envelope.type === "native.response" ||
         envelope.type === "error"
@@ -1041,11 +1322,23 @@
       });
   }
 
+  function cancelInputRequests(code) {
+    for (const [id, pending] of Array.from(pendingRequests)) {
+      if (pending.channel !== "input") continue;
+      postScopedInputCancel(id, pending);
+      finishPendingRequest(id, createError("The input document became inactive", code));
+    }
+  }
+
   function handleVisibilityChange() {
-    if (document.visibilityState === "hidden") flushStoragePatch();
+    if (document.visibilityState === "hidden") {
+      cancelInputRequests("INPUT_DOCUMENT_HIDDEN");
+      flushStoragePatch();
+    }
   }
 
   function handlePageHide(event) {
+    cancelInputRequests("CONTEXT_INVALIDATED");
     if (event.persisted) flushStoragePatch();
     else {
       flushStorageSnapshotBeforeUnload();
@@ -1056,11 +1349,13 @@
   function cleanup() {
     if (disposed) return;
     flushStorageSnapshotBeforeUnload();
+    cancelInputRequests("CONTEXT_INVALIDATED");
+    inputSnapshotProvider = null;
     disposed = true;
-    if (storageFlushTimer !== null) clearTimeout(storageFlushTimer);
-    storageFlushTimer = null;
+    disposeStorage(createError("Android context was invalidated", "CONTEXT_INVALIDATED"));
     for (const pending of pendingRequests.values()) {
       clearTimeout(pending.timer);
+      if (pending.abortCleanup) { try { pending.abortCleanup(); } catch (_) {} }
       const error = createError("Android context was invalidated", "CONTEXT_INVALIDATED");
       if (pending.callback) invokeCallback(pending.callback, undefined, error);
       else pending.reject(error);
@@ -1085,11 +1380,18 @@
     chrome: { value: chromeApi, enumerable: true },
     nativeRequest: { value: nativeRequest, enumerable: true },
     inputDocumentToken: { value: inputDocumentToken, enumerable: false },
+    inputDocumentNonce: { enumerable: false, get: () => inputDocumentNonce },
+    registerInputSnapshotProvider: { value: registerInputSnapshotProvider, enumerable: false },
+    captureInputSnapshot: { value: captureInputSnapshot, enumerable: false },
     nativeEvents: { value: nativeEvents.event, enumerable: true },
     onNativeEvent: { value: nativeEvents.event, enumerable: true },
     profile: { enumerable: true, get: () => cloneForPublic(profileState) },
     disposed: { enumerable: true, get: () => disposed },
-    flushStorage: { value: flushStoragePatch, enumerable: false },
+    ready: { enumerable: true, get: ensureStorageReady },
+    refreshStorage: { value: refreshStorage, enumerable: false },
+    storageRevision: { enumerable: false, get: () => storageRevision },
+    flushStorage: { value: flushStorage, enumerable: false },
+    flushStorageBeforeUnload: { value: flushStorageSnapshotBeforeUnload, enumerable: false },
     cleanup: { value: cleanup, enumerable: false }
   });
   Object.preventExtensions(publicRuntime);

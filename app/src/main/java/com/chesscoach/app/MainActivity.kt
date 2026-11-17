@@ -16,6 +16,7 @@ import android.os.Looper
 import android.os.Message
 import android.os.PowerManager
 import android.os.SystemClock
+import android.text.InputType
 import android.view.InputDevice
 import android.view.Gravity
 import android.view.MotionEvent
@@ -32,9 +33,11 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.ProgressBar
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
@@ -52,6 +55,7 @@ import androidx.webkit.ScriptHandler
 import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.nio.charset.StandardCharsets
@@ -87,9 +91,28 @@ class MainActivity : AppCompatActivity() {
     private val profileLimiter = SlidingWindowLimiter(10, 60_000L)
     private val platformLimiter = SlidingWindowLimiter(4, 60_000L)
     private val engineLimiter = SlidingWindowLimiter(100, 5_000L)
-    private val touchLimiter = SlidingWindowLimiter(12, 5_000L)
-    private var pendingTouch: PendingTouchRequest? = null
     private var dispatchingNativeTouch = false
+    private val nativeInput = NativeInputController(object : NativeInputController.Host {
+        override fun now(): Long = SystemClock.uptimeMillis()
+        override fun rateNow(): Long = SystemClock.elapsedRealtime()
+        override fun state(view: Any): NativeInputController.ViewState {
+            val browser = view as WebView
+            return NativeInputController.ViewState(
+                pageGeneration, browser === mainWebView, isResumedState, isDestroyedState,
+                inputNavigationPending, popupWebView != null, browser.isAttachedToWindow,
+                browser.isShown && browser.windowVisibility == View.VISIBLE, browser.hasWindowFocus(),
+                browser.width, browser.height, browser.paddingLeft, browser.paddingTop, browser.paddingRight,
+                browser.paddingBottom, if (browser === mainWebView) browser.url.orEmpty() else ""
+            )
+        }
+        override fun inspect(view: Any, script: String, callback: (String?) -> Unit) {
+            (view as WebView).evaluateJavascript(script) { callback(it) }
+        }
+        override fun dispatch(view: Any, action: Int, point: BridgeProtocol.TouchPoint, downTime: Long): Boolean =
+            dispatchNativeTouch(view as WebView, action, point, downTime)
+        override fun schedule(runnable: Runnable, at: Long) { mainHandler.postAtTime(runnable, at) }
+        override fun remove(runnable: Runnable) { mainHandler.removeCallbacks(runnable) }
+    })
     private val browserPopups = mutableListOf<WebView>()
     private val authenticationWindows = mutableSetOf<WebView>()
     private val popupWebView: WebView? get() = browserPopups.lastOrNull()
@@ -108,6 +131,7 @@ class MainActivity : AppCompatActivity() {
     private var documentStartHandler: ScriptHandler? = null
     private var privacyStartHandler: ScriptHandler? = null
     private var pageGeneration = 0L
+    private var inputNavigationPending = false
     private var storageRevision = 0L
     private var engineDocumentLoaded = false
     private var isResumedState = false
@@ -164,6 +188,7 @@ class MainActivity : AppCompatActivity() {
         if (!restoreTrustedState(savedInstanceState)) {
             mainWebView.loadUrl(lastPlatform().url)
         }
+        mainHandler.post { handleIncomingAuthenticationIntent(intent) }
 
         if (!bridgeFeaturesAvailable()) {
             Toast.makeText(
@@ -172,6 +197,27 @@ class MainActivity : AppCompatActivity() {
                 Toast.LENGTH_LONG
             ).show()
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIncomingAuthenticationIntent(intent)
+    }
+
+    private fun handleIncomingAuthenticationIntent(intent: Intent?) {
+        val url = when (intent?.action) {
+            Intent.ACTION_VIEW -> intent.data?.toString()?.takeIf(BrowserNavigationPolicy::isChessComFamilyUrl)
+            Intent.ACTION_SEND -> intent.getStringExtra(Intent.EXTRA_TEXT)?.let(BrowserNavigationPolicy::extractSupportedAuthenticationUrl)
+            else -> null
+        }
+        if (url == null) {
+            if (intent?.action == Intent.ACTION_VIEW || intent?.action == Intent.ACTION_SEND) {
+                Toast.makeText(this, "Нужна безопасная HTTPS-ссылка входа", Toast.LENGTH_LONG).show()
+            }
+            return
+        }
+        openAuthenticationTab(Uri.parse(url))
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -183,7 +229,14 @@ class MainActivity : AppCompatActivity() {
                 FrameLayout.LayoutParams.MATCH_PARENT
             )
         }
+        configureMainBrowser(view)
+        return view
+    }
+
+    private fun configureMainBrowser(view: WebView) {
         configureSecureSettings(view, browsing = true)
+        // A site's target=_blank login must stay in the app's primary browsing context.
+        view.settings.setSupportMultipleWindows(false)
         // Native board gestures rely on an unzoomed CSS viewport.
         view.settings.setSupportZoom(false)
         view.settings.builtInZoomControls = false
@@ -197,7 +250,6 @@ class MainActivity : AppCompatActivity() {
             }
             false
         }
-        return view
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -238,10 +290,6 @@ class MainActivity : AppCompatActivity() {
             useWideViewPort = browsing
             loadWithOverviewMode = browsing
             cacheMode = WebSettings.LOAD_DEFAULT
-            val standardUserAgent = userAgentString.orEmpty()
-            if (!standardUserAgent.contains(USER_AGENT_TOKEN)) {
-                userAgentString = "$standardUserAgent $USER_AGENT_TOKEN".trim()
-            }
         }
         CookieManager.getInstance().apply {
             setAcceptCookie(true)
@@ -269,6 +317,8 @@ class MainActivity : AppCompatActivity() {
 
         override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
             pageGeneration++
+            inputNavigationPending = true
+            nativeInput.invalidateDocument("INPUT_DOCUMENT_CHANGED", "The game document is navigating")
             cancelRemoteWork("NAVIGATION_CANCELLED", "Document navigation cancelled the request")
             loadErrorDialog?.dismiss()
             val uri = Uri.parse(url)
@@ -282,6 +332,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun onPageCommitVisible(view: WebView, url: String) {
+            if (view === mainWebView) inputNavigationPending = false
             if (BrowserNavigationPolicy.classify(url) != BrowserNavigationPolicy.Destination.GAME) {
                 view.stopLoading()
                 return
@@ -290,6 +341,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun onPageFinished(view: WebView, url: String) {
+            if (view === mainWebView) inputNavigationPending = false
             super.onPageFinished(view, url)
             CookieManager.getInstance().flush()
             updateBrowserChrome(view, url)
@@ -311,7 +363,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
-            if (!::mainWebView.isInitialized || view !== mainWebView) return false
+            if (!::mainWebView.isInitialized || view !== mainWebView) return true
             recoverMainRenderer(detail.didCrash())
             return true
         }
@@ -328,7 +380,10 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(-1, dp(48))
         }
         toolbar.addView(browserButton("\u2039", "Назад") { handleBrowserBack() })
-        browserForward = browserButton("\u203a", "Вперёд") { activeBrowser().goForward() }
+        browserForward = browserButton("\u203a", "Вперёд") {
+            val view = activeBrowser()
+            flushPreferencesBeforeNavigation(view) { view.goForward() }
+        }
         toolbar.addView(browserForward)
         browserAddress = TextView(this).apply {
             setTextColor("#C9D8E4".toColorInt())
@@ -349,7 +404,7 @@ class MainActivity : AppCompatActivity() {
         toolbar.addView(browserAddress, LinearLayout.LayoutParams(0, -2, 1f))
         browserReload = browserButton("\u21bb", "Обновить страницу") {
             val view = activeBrowser()
-            if (view.progress < 100) view.stopLoading() else view.reload()
+            if (view.progress < 100) view.stopLoading() else flushPreferencesBeforeNavigation(view) { view.reload() }
         }
         toolbar.addView(browserReload)
         val menuButton = browserButton("...", "Меню браузера") {}
@@ -398,39 +453,135 @@ class MainActivity : AppCompatActivity() {
 
     private fun showBrowserMenu(anchor: View) {
         val menu = PopupMenu(this, anchor)
-        menu.menu.add(0, 1, 0, "Войти в Chess.com")
+        menu.menu.add(0, 1, 0, "Вход Chess.com во внутренней вкладке")
         menu.menu.add(0, 2, 1, "Открыть Chess.com")
         menu.menu.add(0, 3, 2, "Открыть Lichess")
         menu.menu.add(0, 4, 3, "О проекте и благодарности")
-        if (popupWebView != null) menu.menu.add(0, 5, 4, "Закрыть вкладку")
+        menu.menu.add(0, 6, 5, "Диагностика")
+        menu.menu.add(0, 7, 6, "Открыть ссылку входа")
+        popupWebView?.let { popup ->
+            menu.menu.add(0, 5, 4, if (canAdoptAuthenticationWindow(popup)) "Вернуться к ChessCoach" else "Закрыть вкладку")
+        }
         menu.setOnMenuItemClickListener { item ->
             when (item.itemId) {
-                1 -> openGamePage(BrowserNavigationPolicy.CHESS_COM_LOGIN)
+                1 -> openAuthenticationTab(Uri.parse(BrowserNavigationPolicy.CHESS_COM_LOGIN))
                 2 -> openGamePage(Platform.CHESS_COM.url)
                 3 -> openGamePage(Platform.LICHESS.url)
                 4 -> openBrowserPopup(Uri.parse(BrowserNavigationPolicy.CREDITS_URL))
                 5 -> closeBrowserPopup()
+                6 -> showInputDiagnostics()
+                7 -> showAuthenticationLinkDialog()
             }
             true
         }
         menu.show()
     }
 
-    private fun openGamePage(url: String) {
+    private fun showInputDiagnostics() {
+        val version = packageManager.getPackageInfo(packageName, 0).versionName.orEmpty()
+        val details = TextView(this).apply {
+            setTextIsSelectable(true)
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            textSize = 12f
+            text = "$packageName $version\n\n${nativeInput.diagnostics()}"
+        }
+        val scroll = ScrollView(this).apply { addView(details) }
+        AlertDialog.Builder(this).setTitle("Диагностика приложения").setView(scroll)
+            .setPositiveButton("Закрыть", null).show()
+        val view = mainWebView
+        if (!isTrustedRemoteUri(Uri.parse(view.url.orEmpty()))) return
+        val script = """
+            (function(){try{
+              var g=window.__CC_ANDROID_GAME_SESSION__,p=window.__CC_MOBILE_PREFERENCES__;
+              var s=g?g.snapshot():{},platform=s.platform||(/chess\.com$/.test(location.hostname)?'chesscom':'lichess');
+              var requested=p&&p.isReady?p.get(platform):{},effective=g?g.effective():{};
+              return JSON.stringify({coreReady:!!s.ready,preferencesReady:!!(p&&p.isReady),
+                paused:!!s.paused,foreground:!!s.foreground,lowTier:!!s.lowTier,
+                positionId:s.positionId,boardId:s.boardId,turn:s.turn,myColor:s.myColor,
+                analysis:s.analysis,pendingInput:!!s.pendingInput,
+                requested:{auto:!!requested.autoMoveEnabled,turbo:!!requested.bulletTurboMode,
+                  premove:!!requested.premoveEnabled,ratedBlock:!!requested.safeAntiBanGuard},
+                effective:{auto:!!effective.autoMoveEnabled,turbo:!!effective.bulletTurboMode,
+                  premove:!!effective.premoveEnabled,thermalPause:!!effective.thermalPause}});
+            }catch(e){return JSON.stringify({coreDiagnostics:'unavailable'});}})();
+        """.trimIndent()
+        view.evaluateJavascript(script) { result ->
+            if (isDestroyedState || view !== mainWebView) return@evaluateJavascript
+            val summary = try { JSONArray("[$result]").optString(0, "Недоступно") } catch (_: Exception) { "Недоступно" }
+            details.append("\n\nСостояние игры и настроек:\n$summary")
+        }
+    }
+
+    private fun flushPreferencesBeforeNavigation(view: WebView, action: () -> Unit) {
+        if (isDestroyedState) return
+        val generation = pageGeneration
+        val token = quoteForJavaScript(UUID.randomUUID().toString())
+        val deadline = SystemClock.uptimeMillis() + 5_000L
+        fun isCurrent(): Boolean = !isDestroyedState &&
+            (view === mainWebView || view in browserPopups) && generation == pageGeneration
+        fun inspect() {
+            if (!isCurrent()) return
+            view.evaluateJavascript("(function(){var s=window.__CC_ANDROID_NAV_FLUSH__;return s&&s.token===$token?s.status:'superseded';})();") { result ->
+                if (!isCurrent()) return@evaluateJavascript
+                when (result) {
+                    "\"ready\"" -> action()
+                    "\"failed\"" -> Toast.makeText(this, "Не удалось сохранить настройки. Переход отменён.", Toast.LENGTH_LONG).show()
+                    "\"superseded\"" -> Unit
+                    else -> if (SystemClock.uptimeMillis() < deadline) mainHandler.postDelayed({ inspect() }, 40L)
+                    else Toast.makeText(this, "Настройки ещё сохраняются. Повторите переход.", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+        val script = """
+            (function(){
+              var r=window.__CC_ANDROID_RUNTIME__;
+              if(!r||typeof r.flushStorage!=='function')return 'ready';
+              var token=$token;
+              window.__CC_ANDROID_NAV_FLUSH__={token:token,status:'pending'};
+              Promise.resolve().then(function(){return r.flushStorage();}).then(function(){
+                var s=window.__CC_ANDROID_NAV_FLUSH__;if(s&&s.token===token)s.status='ready';
+              },function(){
+                var s=window.__CC_ANDROID_NAV_FLUSH__;if(s&&s.token===token)s.status='failed';
+              });
+              return 'pending';
+            })();
+        """.trimIndent()
+        view.evaluateJavascript(script) { result ->
+            if (!isCurrent()) return@evaluateJavascript
+            if (result == "\"ready\"") action() else inspect()
+        }
+    }
+
+    private fun openGamePage(url: String, reloadCurrentDocument: Boolean = false) {
+        flushPreferencesBeforeNavigation(mainWebView) { navigateGamePage(url, reloadCurrentDocument) }
+    }
+
+    private fun navigateGamePage(url: String, reloadCurrentDocument: Boolean = false) {
+        val popup = popupWebView
+        if (popup != null && canAdoptAuthenticationWindow(popup) && platformForUri(Uri.parse(url)) == Platform.CHESS_COM && !BrowserNavigationPolicy.isAccountPage(url)) {
+            adoptAuthenticationWindow(popup, url)
+            return
+        }
         closeAllBrowserPopups(restoreMain = false)
         pendingMainReload = false
         val platform = platformForUri(Uri.parse(url)) ?: return
+        val targetView = mainWebView
         storageExecutor.execute {
             val saved = try {
                 storageRepository.set(JSONObject().put(PLATFORM_STORAGE_KEY, platform.storageValue))
                 true
             } catch (_: Exception) { false }
             mainHandler.post {
-                if (isDestroyedState) return@post
+                if (isDestroyedState || mainWebView !== targetView) return@post
                 if (saved) storageRevision++
-                installDocumentStartScripts(mainWebView)
-                if (isResumedState) mainWebView.onResume()
-                mainWebView.loadUrl(url)
+                installDocumentStartScripts(targetView)
+                if (isResumedState) targetView.onResume()
+                if (reloadCurrentDocument && targetView.url?.substringBefore('#') == url.substringBefore('#')) {
+                    if (targetView.url != url) targetView.loadUrl(url)
+                    targetView.reload()
+                } else {
+                    targetView.loadUrl(url)
+                }
                 if (!saved) Toast.makeText(this, "Не удалось сохранить выбор площадки. Страница всё равно открыта.", Toast.LENGTH_LONG).show()
             }
         }
@@ -438,9 +589,16 @@ class MainActivity : AppCompatActivity() {
 
     private fun routeBrowserNavigation(view: WebView, uri: Uri, userGesture: Boolean): Boolean {
         return when (BrowserNavigationPolicy.classify(uri.toString())) {
-            BrowserNavigationPolicy.Destination.GAME -> false
+            BrowserNavigationPolicy.Destination.GAME -> {
+                if (view === mainWebView && uri.host.equals("www.chess.com", ignoreCase = true) && BrowserNavigationPolicy.isAccountPage(uri.toString())) {
+                    openAuthenticationTab(uri)
+                    true
+                } else false
+            }
             BrowserNavigationPolicy.Destination.GOOGLE_AUTH -> {
-                showGoogleSignInHelp()
+                if (view in browserPopups) authenticationWindows.add(view)
+                view.stopLoading()
+                showGoogleSignInUnavailable()
                 true
             }
             BrowserNavigationPolicy.Destination.WEB -> {
@@ -466,22 +624,53 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun showGoogleSignInHelp() {
-        if (googleSignInDialog?.isShowing == true || isDestroyedState) return
-        closeAllBrowserPopups()
-        if (BrowserNavigationPolicy.classify(mainWebView.url.orEmpty()) != BrowserNavigationPolicy.Destination.GAME) {
-            mainWebView.loadUrl(BrowserNavigationPolicy.CHESS_COM_LOGIN)
+    private fun openAuthenticationTab(uri: Uri) {
+        if (isDestroyedState || !BrowserNavigationPolicy.isSupportedAuthenticationUrl(uri.toString())) return
+        val current = popupWebView
+        if (current != null && current in authenticationWindows) {
+            if (current.url != uri.toString()) current.loadUrl(uri.toString())
+            current.visibility = View.VISIBLE
+            updateBrowserChrome(current, uri.toString())
+            return
         }
-        googleSignInDialog = AlertDialog.Builder(this)
-            .setTitle("Вход через Google")
-            .setMessage("Google не разрешает вход во встроенном WebView. Чтобы войти именно в приложение, используйте логин и пароль Chess.com. Если аккаунт создан через Google, задайте пароль через восстановление на Chess.com.\n\nМожно открыть защищённую вкладку браузера с новой сессией входа. Она не переносит авторизацию в приложение.")
-            .setPositiveButton("Войти паролем") { _, _ -> openGamePage(BrowserNavigationPolicy.CHESS_COM_LOGIN) }
-            .setNeutralButton("Вкладка браузера") { _, _ ->
-                // Restart at Chess.com: continuing Google's URL would lose the WebView OAuth state cookie.
-                openExternal(Uri.parse(BrowserNavigationPolicy.CHESS_COM_LOGIN))
+        flushPreferencesBeforeNavigation(mainWebView) {
+            if (browserPopups.size >= 3) {
+                Toast.makeText(this, "Сначала закройте одну из открытых вкладок", Toast.LENGTH_SHORT).show()
+            } else {
+                createBrowserPopup(authentication = true).loadUrl(uri.toString())
             }
-            .setNegativeButton("Отмена", null)
-            .create().also { it.show() }
+        }
+    }
+
+    private fun showGoogleSignInUnavailable() {
+        if (isDestroyedState || googleSignInDialog?.isShowing == true) return
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Google-вход недоступен во WebView")
+            .setMessage("Google запрещает OAuth-вход во встроенных браузерах, которыми управляет приложение. Поэтому Chess.com показывает общую ошибку \"There was an issue logging in with Google\". Это не исправляется cookies или настройками WebView.\n\nИспользуйте быструю ссылку из письма в том же профиле: Поделиться → ChessCoach или вставьте ссылку вручную. Также доступна обычная форма Chess.com. Проверку Cloudflare на форме нужно пройти.")
+            .setPositiveButton("Вставить ссылку") { _, _ -> mainHandler.post { if (!isDestroyedState) showAuthenticationLinkDialog() } }
+            .setNeutralButton("Форма Chess.com") { _, _ -> mainHandler.post { if (!isDestroyedState) openAuthenticationTab(Uri.parse(BrowserNavigationPolicy.CHESS_COM_LOGIN)) } }
+            .setNegativeButton("Закрыть", null)
+            .create()
+        dialog.setOnDismissListener { if (googleSignInDialog === dialog) googleSignInDialog = null }
+        googleSignInDialog = dialog
+        dialog.show()
+    }
+
+    private fun showAuthenticationLinkDialog() {
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            hint = "https://..."
+            maxLines = 3
+        }
+        AlertDialog.Builder(this).setTitle("Ссылка входа в приложении")
+            .setMessage("Можно вставить ссылку из письма и открыть её в том же браузерном профиле. Ссылка не сохраняется в настройках или диагностике.")
+            .setView(input)
+            .setPositiveButton("Открыть") { _, _ ->
+                val url = BrowserNavigationPolicy.extractSupportedAuthenticationUrl(input.text.toString())
+                if (url != null) openAuthenticationTab(Uri.parse(url))
+                else Toast.makeText(this, "Для вкладки входа нужен безопасный HTTPS-адрес", Toast.LENGTH_LONG).show()
+            }
+            .setNegativeButton("Отмена", null).show()
     }
 
     private fun createBrowserWebChromeClient(): WebChromeClient = object : WebChromeClient() {
@@ -512,7 +701,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private fun createBrowserPopup(): WebView {
+    private fun createBrowserPopup(authentication: Boolean = false): WebView {
         val parent = activeBrowser()
         val inheritsAuthFlow = parent in authenticationWindows || BrowserNavigationPolicy.isAccountPage(parent.url.orEmpty())
         cancelRemoteWork("BROWSER_OPEN", "A browser window paused game interaction")
@@ -526,7 +715,7 @@ class MainActivity : AppCompatActivity() {
         // Browsing/authentication windows share WebView cookies, never the engine/native bridge.
         configureSecureSettings(popup, browsing = true)
         browserPopups.add(popup)
-        if (inheritsAuthFlow) authenticationWindows.add(popup)
+        if (authentication || inheritsAuthFlow) authenticationWindows.add(popup)
         popup.webChromeClient = createBrowserWebChromeClient()
         popup.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
@@ -546,7 +735,13 @@ class MainActivity : AppCompatActivity() {
                 loadErrorDialog?.dismiss()
                 if (BrowserNavigationPolicy.isAccountPage(url)) authenticationWindows.add(view)
                 val destination = BrowserNavigationPolicy.classify(url)
-                if (destination == BrowserNavigationPolicy.Destination.BLOCKED || destination == BrowserNavigationPolicy.Destination.GOOGLE_AUTH || destination == BrowserNavigationPolicy.Destination.EXTERNAL_APP) {
+                if (destination == BrowserNavigationPolicy.Destination.GOOGLE_AUTH) {
+                    authenticationWindows.add(view)
+                    view.stopLoading()
+                    showGoogleSignInUnavailable()
+                    return
+                }
+                if (destination == BrowserNavigationPolicy.Destination.BLOCKED || destination == BrowserNavigationPolicy.Destination.EXTERNAL_APP) {
                     view.stopLoading()
                     routeBrowserNavigation(view, Uri.parse(url), userGesture = false)
                     return
@@ -566,6 +761,12 @@ class MainActivity : AppCompatActivity() {
 
             override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
                 if (request.isForMainFrame) showBrowserError(view, "Не удалось загрузить страницу. Проверьте соединение; небезопасные соединения не разрешены.")
+            }
+
+            override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, response: WebResourceResponse) {
+                if (request.isForMainFrame && request.url.host == "accounts.google.com" && response.statusCode in setOf(400, 403)) {
+                    showBrowserError(view, "Сервис Google отклонил вход из Android WebView (HTTP ${response.statusCode}). Мы не подменяем браузер и не переносим сессию из Chrome. Другой поддерживаемый способ входа можно выбрать в этой же вкладке.")
+                }
             }
 
             override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
@@ -589,6 +790,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun closeBrowserPopup(restoreMain: Boolean = true) {
         val popup = popupWebView ?: return
+        if (restoreMain && canAdoptAuthenticationWindow(popup)) {
+            adoptAuthenticationWindow(popup, popup.url.orEmpty())
+            return
+        }
         browserPopups.remove(popup)
         pendingMainReload = authenticationWindows.remove(popup) || pendingMainReload
         loadErrorDialog?.dismiss()
@@ -603,6 +808,29 @@ class MainActivity : AppCompatActivity() {
         } else {
             resumeMainBrowser()
         }
+    }
+
+    private fun canAdoptAuthenticationWindow(view: WebView): Boolean =
+        BrowserNavigationPolicy.canAdoptAuthenticationWindow(view.url.orEmpty(), view in authenticationWindows, view.progress, browserPopups.size > 1)
+
+    private fun adoptAuthenticationWindow(view: WebView, url: String) {
+        flushPreferencesBeforeNavigation(mainWebView) { activateAuthenticationWindow(view, url) }
+    }
+
+    private fun activateAuthenticationWindow(view: WebView, url: String) {
+        if (isDestroyedState || view !== popupWebView || !canAdoptAuthenticationWindow(view)) return
+        cancelRemoteWork("AUTH_WINDOW_RETURN", "The signed-in browser window became the main window")
+        browserPopups.remove(view)
+        authenticationWindows.remove(view)
+        closeAllBrowserPopups(restoreMain = false)
+        val previousMain = mainWebView
+        mainWebView = view
+        pageGeneration++
+        view.visibility = View.VISIBLE
+        configureMainBrowser(view)
+        detachAndDestroyWebView(previousMain, REMOTE_BRIDGE_NAME)
+        // Reload the same WebView: its cookies and sessionStorage stay with the authenticated tab.
+        navigateGamePage(url, reloadCurrentDocument = true)
     }
 
     private fun closeAllBrowserPopups(restoreMain: Boolean = true) {
@@ -708,7 +936,7 @@ class MainActivity : AppCompatActivity() {
         replyProxy: JavaScriptReplyProxy
     ) {
         if (
-            isDestroyedState || !isResumedState || sourceView !== mainWebView || !isMainFrame ||
+            isDestroyedState || sourceView !== mainWebView || !isMainFrame ||
             trustedOrigin(sourceOrigin) == null ||
             trustedOrigin(sourceOrigin) != trustedOrigin(Uri.parse(sourceView.url.orEmpty()))
         ) {
@@ -734,8 +962,14 @@ class MainActivity : AppCompatActivity() {
         try {
             enforceRemoteMessageSize(message, raw)
             validateRemoteMetadata(message)
+            if (!isResumedState && !message.type.startsWith("input.")) {
+                postError(replyProxy, message.id, "APP_PAUSED", "The app is paused")
+                return
+            }
             when (message.type) {
                 "runtime.message" -> handleRuntimeRequest(message, replyProxy, sourceOrigin)
+                "storage.get" -> handleStorageGet(message, replyProxy)
+                "storage.patch" -> handleStoragePatch(message, replyProxy)
                 "storage.set" -> handleStorageSet(message, replyProxy)
                 "storage.replace" -> handleStorageReplace(message, replyProxy)
                 "storage.remove" -> handleStorageRemove(message, replyProxy)
@@ -744,12 +978,12 @@ class MainActivity : AppCompatActivity() {
                 "platform.switch" -> handlePlatformSwitch(message, replyProxy)
                 "project.open" -> {
                     BridgeProtocol.requireOnlyKeys(message.payload, emptySet())
-                    require(touchLimiter.tryAcquire()) { "Browser action rate exceeded" }
+                    require(nativeInput.tryBrowserAction()) { "Browser action rate exceeded" }
                     postReply(replyProxy, BridgeProtocol.response(message.id, "project.open.response", "project", JSONObject().put("ok", true)))
                     mainHandler.post { if (!isDestroyedState) openBrowserPopup(Uri.parse(BrowserNavigationPolicy.CREDITS_URL)) }
                 }
-                "input.gesture" -> handleTouchGesture(message, replyProxy, sourceView)
-                "input.cancel" -> handleTouchCancel(message, replyProxy)
+                "input.context.get", "input.gesture", "input.cancel" ->
+                    nativeInput.handle(message, sourceView, trustedOrigin(sourceOrigin)!!) { postReply(replyProxy, it) }
                 else -> postError(replyProxy, message.id, "UNSUPPORTED_TYPE", "Message type is not supported")
             }
         } catch (error: Exception) {
@@ -904,17 +1138,42 @@ class MainActivity : AppCompatActivity() {
         postReply(pending.replyProxy, response.toString())
     }
 
+    private fun handleStorageGet(message: BridgeProtocol.Message, replyProxy: JavaScriptReplyProxy) {
+        require(storageLimiter.tryAcquire()) { "Storage rate exceeded" }
+        BridgeProtocol.requireOnlyKeys(message.payload, emptySet())
+        runAsyncRequest(message.id, replyProxy, durable = true) {
+            AsyncResult("storage.response", "storage", storageRepository.state())
+        }
+    }
+
+    private fun handleStoragePatch(message: BridgeProtocol.Message, replyProxy: JavaScriptReplyProxy) {
+        require(storageLimiter.tryAcquire()) { "Storage rate exceeded" }
+        BridgeProtocol.requireOnlyKeys(message.payload, setOf("baseRevision", "mutationId", "items", "keys", "clear"))
+        val rawRevision = message.payload.opt("baseRevision") as? Number ?: throw IllegalArgumentException("Base revision is required")
+        val baseRevision = rawRevision.toLong()
+        require(rawRevision.toDouble() == baseRevision.toDouble() && baseRevision >= 0) { "Invalid base revision" }
+        val mutationId = message.payload.getString("mutationId")
+        val items = message.payload.optJSONObject("items") ?: throw IllegalArgumentException("Changed items are required")
+        val array = message.payload.optJSONArray("keys") ?: throw IllegalArgumentException("Removed keys are required")
+        require(array.length() <= AtomicStorageRepository.MAX_MUTATION_KEYS) { "Too many removed keys" }
+        val keys = (0 until array.length()).map { array.getString(it) }
+        val clear = message.payload.opt("clear") as? Boolean ?: throw IllegalArgumentException("Clear flag is required")
+        runAsyncRequest(message.id, replyProxy, durable = true) {
+            AsyncResult("storage.response", "storage", storageRepository.patch(baseRevision, mutationId, items, keys, clear), refreshBootstrap = true)
+        }
+    }
+
     private fun handleStorageSet(message: BridgeProtocol.Message, replyProxy: JavaScriptReplyProxy) {
         require(storageLimiter.tryAcquire()) { "Storage rate exceeded" }
         BridgeProtocol.requireOnlyKeys(message.payload, setOf("items"))
         val items = message.payload.optJSONObject("items")
             ?: throw IllegalArgumentException("Storage items are required")
-        runAsyncRequest(message.id, replyProxy) {
+        runAsyncRequest(message.id, replyProxy, durable = true) {
             storageRepository.set(items)
             AsyncResult(
                 "storage.response",
                 "storage",
-                JSONObject().put("ok", true).put("operation", "set"),
+                storageRepository.state().put("operation", "set"),
                 refreshBootstrap = true
             )
         }
@@ -925,12 +1184,12 @@ class MainActivity : AppCompatActivity() {
         BridgeProtocol.requireOnlyKeys(message.payload, setOf("items"))
         val items = message.payload.optJSONObject("items")
             ?: throw IllegalArgumentException("Storage items are required")
-        runAsyncRequest(message.id, replyProxy) {
+        runAsyncRequest(message.id, replyProxy, durable = true) {
             storageRepository.replace(items)
             AsyncResult(
                 "storage.response",
                 "storage",
-                JSONObject().put("ok", true).put("operation", "replace"),
+                storageRepository.state().put("operation", "replace"),
                 refreshBootstrap = true
             )
         }
@@ -944,12 +1203,12 @@ class MainActivity : AppCompatActivity() {
         require(array.length() <= AtomicStorageRepository.MAX_MUTATION_KEYS) { "Too many storage keys" }
         val keys = ArrayList<String>(array.length())
         for (index in 0 until array.length()) keys += array.getString(index)
-        runAsyncRequest(message.id, replyProxy) {
+        runAsyncRequest(message.id, replyProxy, durable = true) {
             storageRepository.remove(keys)
             AsyncResult(
                 "storage.response",
                 "storage",
-                JSONObject().put("ok", true).put("operation", "remove"),
+                storageRepository.state().put("operation", "remove"),
                 refreshBootstrap = true
             )
         }
@@ -958,12 +1217,12 @@ class MainActivity : AppCompatActivity() {
     private fun handleStorageClear(message: BridgeProtocol.Message, replyProxy: JavaScriptReplyProxy) {
         require(storageLimiter.tryAcquire()) { "Storage rate exceeded" }
         BridgeProtocol.requireOnlyKeys(message.payload, emptySet())
-        runAsyncRequest(message.id, replyProxy) {
+        runAsyncRequest(message.id, replyProxy, durable = true) {
             storageRepository.clear()
             AsyncResult(
                 "storage.response",
                 "storage",
-                JSONObject().put("ok", true).put("operation", "clear"),
+                storageRepository.state().put("operation", "clear"),
                 refreshBootstrap = true
             )
         }
@@ -994,169 +1253,23 @@ class MainActivity : AppCompatActivity() {
         BridgeProtocol.requireOnlyKeys(message.payload, setOf("platform"))
         val platform = Platform.fromWire(message.payload.optString("platform", ""))
             ?: throw IllegalArgumentException("Platform must be LICHESS or CHESS_COM")
-        runAsyncRequest(message.id, replyProxy) {
+        runAsyncRequest(message.id, replyProxy, durable = true) {
             storageRepository.set(JSONObject().put(PLATFORM_STORAGE_KEY, platform.storageValue))
             AsyncResult(
                 "platform.switch.response",
                 "platform",
-                JSONObject().put("ok", true).put("platform", platform.wireValue),
+                storageRepository.state().put("platform", platform.wireValue),
                 refreshBootstrap = true,
                 navigation = platform
             )
         }
     }
 
-    private fun handleTouchGesture(
-        message: BridgeProtocol.Message,
-        replyProxy: JavaScriptReplyProxy,
-        view: WebView
-    ) {
-        require(message.envelope.opt("scope") == BridgeProtocol.SCOPE) { "Input scope is required" }
-        require(message.envelope.opt("source") == "remote" && message.envelope.opt("target") == "NATIVE") {
-            "Invalid input route"
-        }
-        require(message.envelope.opt("channel") == "input") { "Input channel is required" }
-        val gesture = BridgeProtocol.validateTouchGesture(message.payload)
-        if (pendingTouch != null) {
-            postError(replyProxy, message.id, "INPUT_BUSY", "Another native gesture is pending")
-            return
-        }
-        if (!touchLimiter.tryAcquire()) {
-            postError(replyProxy, message.id, "INPUT_RATE_LIMITED", "Native touch rate exceeded")
-            return
-        }
-        val pending = PendingTouchRequest(message.id, replyProxy, view, pageGeneration, view.url.orEmpty(), gesture)
-        if (!isTouchContextCurrent(pending)) {
-            postError(replyProxy, message.id, "INPUT_UNAVAILABLE", "The game view is not visible and focused")
-            return
-        }
-        pendingTouch = pending
-        pending.timeout = Runnable {
-            if (pendingTouch === pending) cancelPendingTouch("INPUT_TIMEOUT", "Native gesture timed out")
-        }.also { mainHandler.postDelayed(it, TOUCH_REQUEST_TIMEOUT_MS) }
-        val script = """
-            (function() {
-              const viewport = window.visualViewport;
-              return {
-                href: String(location.href), visible: document.visibilityState === "visible" && window === window.top,
-                documentToken: window.__CC_ANDROID_RUNTIME__ && window.__CC_ANDROID_RUNTIME__.inputDocumentToken,
-                viewport: {
-                  width: viewport ? viewport.width : window.innerWidth,
-                  height: viewport ? viewport.height : window.innerHeight,
-                  offsetLeft: viewport ? viewport.offsetLeft : 0,
-                  offsetTop: viewport ? viewport.offsetTop : 0
-                }
-              };
-            })();
-        """.trimIndent()
-        try {
-            view.evaluateJavascript(script) { result ->
-                if (pendingTouch !== pending) return@evaluateJavascript
-                try {
-                    require(isTouchContextCurrent(pending)) { "Native touch context changed" }
-                    val actual = JSONObject(result ?: "null")
-                    require(actual.opt("visible") == true && actual.opt("href") == pending.url) { "Game document is not visible" }
-                    require(actual.opt("documentToken") == gesture.documentToken) { "Touch document changed" }
-                    val viewport = BridgeProtocol.validateTouchViewport(actual.getJSONObject("viewport"))
-                    val width = view.width - view.paddingLeft - view.paddingRight
-                    val height = view.height - view.paddingTop - view.paddingBottom
-                    // Client coordinates are CSS pixels in the layout viewport, not Android dp.
-                    pending.points = BridgeProtocol.mapTouchPoints(gesture, viewport, width, height).map {
-                        BridgeProtocol.TouchPoint(it.x + view.paddingLeft, it.y + view.paddingTop)
-                    }
-                    pending.viewWidth = view.width
-                    pending.viewHeight = view.height
-                    pending.downTime = SystemClock.uptimeMillis()
-                    pending.downSent = true
-                    if (!dispatchNativeTouch(pending, MotionEvent.ACTION_DOWN, pending.points.first())) {
-                        cancelPendingTouch("INPUT_REJECTED", "WebView rejected the touch down")
-                        return@evaluateJavascript
-                    }
-                    scheduleTouchStep(pending, 1)
-                } catch (error: Exception) {
-                    cancelPendingTouch("INPUT_CONTEXT_CHANGED", error.message ?: "Native touch validation failed")
-                }
-            }
-        } catch (error: Exception) {
-            cancelPendingTouch("INPUT_UNAVAILABLE", error.message ?: "Could not inspect the game viewport")
-        }
-    }
-
-    private fun handleTouchCancel(message: BridgeProtocol.Message, replyProxy: JavaScriptReplyProxy) {
-        require(message.envelope.opt("scope") == BridgeProtocol.SCOPE &&
-            message.envelope.opt("source") == "remote" && message.envelope.opt("target") == "NATIVE" &&
-            message.envelope.opt("channel") == "input") { "Invalid input cancellation route" }
-        BridgeProtocol.requireOnlyKeys(message.payload, setOf("documentToken"))
-        val token = message.payload.opt("documentToken") as? String
-        require(token != null && MESSAGE_ID_PATTERN.matches(token)) { "Invalid touch document token" }
-        val cancelled = pendingTouch?.gesture?.documentToken == token
-        if (cancelled) cancelPendingTouch("INPUT_CANCELLED", "The game core cancelled the native gesture")
-        postReply(
-            replyProxy,
-            BridgeProtocol.response(
-                message.id, "input.cancel.response", "input", JSONObject().put("ok", true).put("cancelled", cancelled)
-            )
-        )
-    }
-
-    private fun isTouchContextCurrent(pending: PendingTouchRequest): Boolean {
-        val view = pending.view
-        return !isDestroyedState && isResumedState && popupWebView == null && view === mainWebView &&
-            pending.pageGeneration == pageGeneration && view.url == pending.url &&
-            isTrustedRemoteUri(Uri.parse(pending.url)) && view.isAttachedToWindow && view.isShown &&
-            view.windowVisibility == View.VISIBLE && view.hasWindowFocus() &&
-            view.width > 0 && view.height > 0 &&
-            (pending.viewWidth == 0 || (view.width == pending.viewWidth && view.height == pending.viewHeight))
-    }
-
-    private fun scheduleTouchStep(pending: PendingTouchRequest, index: Int) {
-        if (pendingTouch !== pending) return
-        val dragging = pending.gesture.action == "drag"
-        val moving = dragging && index < pending.points.size
-        val elapsed = if (moving) {
-            pending.gesture.durationMs.toLong() * index / pending.points.size
-        } else {
-            pending.gesture.durationMs.toLong()
-        }
-        val step = Runnable {
-            if (pendingTouch !== pending) return@Runnable
-            if (!isTouchContextCurrent(pending) || SystemClock.uptimeMillis() - pending.downTime > pending.gesture.durationMs + 250L) {
-                cancelPendingTouch("INPUT_CONTEXT_CHANGED", "Native gesture context changed")
-                return@Runnable
-            }
-            val point = if (moving) pending.points[index] else pending.points.last()
-            val action = if (moving) MotionEvent.ACTION_MOVE else MotionEvent.ACTION_UP
-            try {
-                if (!dispatchNativeTouch(pending, action, point)) {
-                    cancelPendingTouch("INPUT_REJECTED", "WebView rejected the native gesture")
-                } else if (moving) {
-                    scheduleTouchStep(pending, index + 1)
-                } else {
-                    pendingTouch = null
-                    pending.downSent = false
-                    pending.timeout?.let(mainHandler::removeCallbacks)
-                    postReply(
-                        pending.replyProxy,
-                        BridgeProtocol.response(
-                            pending.id,
-                            "input.gesture.response",
-                            "input",
-                            JSONObject().put("ok", true).put("dispatched", true).put("action", pending.gesture.action)
-                        )
-                    )
-                }
-            } catch (error: Exception) {
-                cancelPendingTouch("INPUT_FAILED", error.message ?: "Native gesture dispatch failed")
-            }
-        }
-        pending.step = step
-        mainHandler.postAtTime(step, pending.downTime + elapsed)
-    }
-
     private fun dispatchNativeTouch(
-        pending: PendingTouchRequest,
+        view: WebView,
         action: Int,
-        point: BridgeProtocol.TouchPoint
+        point: BridgeProtocol.TouchPoint,
+        downTime: Long
     ): Boolean {
         val properties = MotionEvent.PointerProperties().apply {
             id = 0
@@ -1169,14 +1282,13 @@ class MainActivity : AppCompatActivity() {
             size = 0.1f
         }
         val event = MotionEvent.obtain(
-            pending.downTime, SystemClock.uptimeMillis(), action, 1,
+            downTime, SystemClock.uptimeMillis(), action, 1,
             arrayOf(properties), arrayOf(coordinates), 0, 0, 1f, 1f,
             0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
         )
-        pending.lastPoint = point
         dispatchingNativeTouch = true
         return try {
-            pending.view.dispatchTouchEvent(event)
+            view.dispatchTouchEvent(event)
         } finally {
             dispatchingNativeTouch = false
             event.recycle()
@@ -1184,27 +1296,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun cancelPendingTouch(code: String, message: String) {
-        val pending = pendingTouch ?: return
-        pendingTouch = null
-        pending.step?.let(mainHandler::removeCallbacks)
-        pending.timeout?.let(mainHandler::removeCallbacks)
-        if (pending.downSent) {
-            try {
-                dispatchNativeTouch(pending, MotionEvent.ACTION_CANCEL, pending.lastPoint)
-            } catch (_: Exception) {
-            }
-            pending.downSent = false
-        }
-        postError(pending.replyProxy, pending.id, code, message)
+        nativeInput.cancelCurrent(code, message)
     }
 
     private fun runAsyncRequest(
         id: String,
         replyProxy: JavaScriptReplyProxy,
+        durable: Boolean = false,
         operation: () -> AsyncResult
     ) {
         require(!pendingAsync.containsKey(id)) { "Duplicate async request id" }
-        val pending = PendingAsyncRequest(id, replyProxy, pageGeneration)
+        val pending = PendingAsyncRequest(id, replyProxy, pageGeneration, durable)
         pendingAsync[id] = pending
         pending.future = storageExecutor.submit {
             val result = try {
@@ -1218,7 +1320,7 @@ class MainActivity : AppCompatActivity() {
                         .put(
                             "error",
                             JSONObject()
-                                .put("code", "OPERATION_FAILED")
+                                .put("code", (error as? StorageOperationException)?.code ?: "OPERATION_FAILED")
                                 .put("message", (error.message ?: "Operation failed").take(256))
                         )
                 )
@@ -1228,12 +1330,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun completeAsyncRequest(id: String, result: AsyncResult) {
+        if (result.refreshBootstrap) {
+            storageRevision = result.payload.optLong("revision", storageRevision)
+            if (!isDestroyedState && ::mainWebView.isInitialized) installDocumentStartScripts(mainWebView)
+        }
         val pending = pendingAsync.remove(id) ?: return
         if (isDestroyedState || pending.pageGeneration != pageGeneration) return
-        if (result.refreshBootstrap) {
-            storageRevision++
-            installDocumentStartScripts(mainWebView)
-        }
         postReply(
             pending.replyProxy,
             BridgeProtocol.response(id, result.type, result.channel, result.payload)
@@ -1263,7 +1365,7 @@ class MainActivity : AppCompatActivity() {
     private fun enforceRemoteMessageSize(message: BridgeProtocol.Message, raw: String) {
         val limit = when (message.type) {
             "runtime.message" -> BridgeProtocol.MAX_MESSAGE_BYTES
-            "storage.set", "storage.replace" -> AtomicStorageRepository.MAX_STORAGE_BYTES + 8 * 1024
+            "storage.set", "storage.replace", "storage.patch" -> AtomicStorageRepository.MAX_STORAGE_BYTES + 8 * 1024
             else -> BridgeProtocol.MAX_SMALL_MESSAGE_BYTES
         }
         require(raw.toByteArray(StandardCharsets.UTF_8).size <= limit) { "Message exceeds type limit" }
@@ -1335,7 +1437,7 @@ class MainActivity : AppCompatActivity() {
         val requests = pendingAsync.values.toList()
         pendingAsync.clear()
         requests.forEach {
-            it.future?.cancel(true)
+            if (!it.durable) it.future?.cancel(true)
             postError(it.replyProxy, it.id, code, message)
         }
     }
@@ -1353,10 +1455,17 @@ class MainActivity : AppCompatActivity() {
             .put("runtimeId", RUNTIME_ID)
             .put("documentId", "android-$pageGeneration")
             .put("clientInstanceId", clientInstanceId)
+        val stored = try {
+            storageRepository.state()
+        } catch (_: StorageOperationException) {
+            JSONObject().put("ok", false).put("items", JSONObject()).put("revision", storageRevision)
+        }
+        storageRevision = stored.optLong("revision", storageRevision)
         val bootstrap = JSONObject()
             .put("v", BridgeProtocol.VERSION)
-            .put("storage", storageRepository.snapshot())
+            .put("storage", stored.getJSONObject("items"))
             .put("storageRevision", storageRevision)
+            .put("storageReady", stored.optBoolean("ok"))
             .put("profile", profile)
         val quotedBootstrap = quoteForJavaScript(bootstrap.toString())
         val privacyScript = readAssetText("content/privacy-mask-bootstrap.js").orEmpty()
@@ -1452,6 +1561,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun buildMainBundle(platform: Platform): String? {
         val paths = ArrayList<String>()
+        paths += "bridge/cc-mobile-preferences.js"
+        paths += "bridge/cc-mobile-session.js"
         paths += "lib/openings.js"
         paths += "lib/explainer.js"
         paths += "lib/phonk-fx.js"
@@ -1609,6 +1720,10 @@ class MainActivity : AppCompatActivity() {
     private fun handleBrowserBack() {
         if (isDestroyedState) return
         popupWebView?.let { popup ->
+            if (canAdoptAuthenticationWindow(popup)) {
+                adoptAuthenticationWindow(popup, popup.url.orEmpty())
+                return
+            }
             val history = popup.copyBackForwardList()
             val previous = if (history.currentIndex > 0) history.getItemAtIndex(history.currentIndex - 1)?.url else null
             if (previous != null && BrowserNavigationPolicy.classify(previous) in setOf(BrowserNavigationPolicy.Destination.GAME, BrowserNavigationPolicy.Destination.WEB, BrowserNavigationPolicy.Destination.CREDITS)) popup.goBack()
@@ -1621,8 +1736,12 @@ class MainActivity : AppCompatActivity() {
             if (isDestroyedState || !isResumedState || popupWebView != null || initiatingView !== mainWebView || generation != pageGeneration || handled == "true") return@evaluateJavascript
             val history = initiatingView.copyBackForwardList()
             val previous = if (history.currentIndex > 0) history.getItemAtIndex(history.currentIndex - 1)?.url else null
-            if (previous != null && BrowserNavigationPolicy.classify(previous) == BrowserNavigationPolicy.Destination.GAME) initiatingView.goBack()
-            else finishAfterTransition()
+            flushPreferencesBeforeNavigation(initiatingView) {
+                if (!isDestroyedState && isResumedState && popupWebView == null && initiatingView === mainWebView && generation == pageGeneration) {
+                    if (previous != null && BrowserNavigationPolicy.classify(previous) == BrowserNavigationPolicy.Destination.GAME) initiatingView.goBack()
+                    else finishAfterTransition()
+                }
+            }
         }
     }
 
@@ -1889,7 +2008,7 @@ class MainActivity : AppCompatActivity() {
         documentStartHandler = null
         privacyStartHandler = null
         mainHandler.removeCallbacksAndMessages(null)
-        storageExecutor.shutdownNow()
+        storageExecutor.shutdown()
         bundleExecutor.shutdownNow()
         if (::mainWebView.isInitialized) detachAndDestroyWebView(mainWebView, REMOTE_BRIDGE_NAME)
         if (::engineWebView.isInitialized) detachAndDestroyWebView(engineWebView, ENGINE_BRIDGE_NAME)
@@ -1923,24 +2042,8 @@ class MainActivity : AppCompatActivity() {
         val id: String,
         val replyProxy: JavaScriptReplyProxy,
         val pageGeneration: Long,
+        val durable: Boolean = false,
         @Volatile var future: Future<*>? = null
-    )
-
-    private data class PendingTouchRequest(
-        val id: String,
-        val replyProxy: JavaScriptReplyProxy,
-        val view: WebView,
-        val pageGeneration: Long,
-        val url: String,
-        val gesture: BridgeProtocol.TouchGesture,
-        var points: List<BridgeProtocol.TouchPoint> = emptyList(),
-        var viewWidth: Int = 0,
-        var viewHeight: Int = 0,
-        var downTime: Long = 0L,
-        var downSent: Boolean = false,
-        var lastPoint: BridgeProtocol.TouchPoint = BridgeProtocol.TouchPoint(0.0, 0.0),
-        var step: Runnable? = null,
-        var timeout: Runnable? = null
     )
 
     private data class AsyncResult(
@@ -1987,11 +2090,9 @@ class MainActivity : AppCompatActivity() {
         private const val REMOTE_BRIDGE_NAME = "CCNative"
         private const val ENGINE_BRIDGE_NAME = "CCEngineNative"
         private const val RUNTIME_ID = "chesscoach_android_v1"
-        private const val USER_AGENT_TOKEN = "ChessCoach/15.9.0-Android"
         private const val PLATFORM_STORAGE_KEY = "cc_mobile_platform"
         private const val REMOTE_ASSET_PREFIX = "/__cc_assets/"
         private const val RUNTIME_TIMEOUT_MS = 70_000L
-        private const val TOUCH_REQUEST_TIMEOUT_MS = 2_500L
         private const val ENGINE_DISPATCH_RETRY_MS = 250L
         private const val ENGINE_RECOVERY_DELAY_MS = 500L
         private const val BUNDLE_RETRY_MS = 500L

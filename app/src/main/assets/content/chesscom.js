@@ -82,6 +82,8 @@
 
   // На Chess.com доступны только безопасные профили: "legit" (по умолчанию) и "all" (расширенный легит)
   let workMode = "legit";
+  let mobilePreferenceUnsubscribe = null;
+  let mobilePreferenceLoad = 0;
   let activeTabId = "analyzer";
   let panelLeft = null;
   let panelTop = null;
@@ -155,7 +157,7 @@
   let phonkEditEnabled = false;
   let mateStyle = "phonk_skull";
   let roflMode = true;
-  let safeAntiBanGuard = true;
+  let safeAntiBanGuard = false;
   let welcomeBannerHidden = false;
 
   const DEFAULT_VISUAL_MASK = Object.freeze({
@@ -228,6 +230,8 @@
   let activeNativeMove = null;
   let nativeMoveFailureKey = "";
   let nativeMoveFailures = 0;
+  let nativeMoveBlockedKey = "";
+  let nativeMoveBlockedState = null;
   let moveCooldownUntil = 0;
   let currentTurnDecision = {
     boardKey: "",
@@ -249,6 +253,12 @@
   let contentInstanceHandle = null;
   let mainIntervalId = null;
   let neuralCanvasRafId = null;
+  const mobileSession = window.__CC_ANDROID_GAME_SESSION__ || null;
+  let unregisterMobileCore = null;
+  let mobileAnalysisLease = null;
+  let mobilePollTimer = null;
+  let cycleWakeTimer = null;
+  let engineRecoveryTimer = null;
 
   const StockfishWasmEngine = window.ChessCoachEngine.create({
     isEnabled: () => useStockfishWasm && !extensionInvalidated && isContextValid()
@@ -283,6 +293,7 @@
   }
 
   function handleEngineVisibilityChange(event) {
+    if (mobileSession) return;
     cancelNativeMove("visibility");
     clearAnalysisRetry();
     if (event?.type === "visibilitychange" && !document.hidden) {
@@ -303,6 +314,10 @@
     extensionInvalidated = true;
     cancelNativeMove("shutdown");
     clearAnalysisRetry();
+    if (unregisterMobileCore) { unregisterMobileCore(); unregisterMobileCore = null; }
+    clearTimeout(mobilePollTimer);
+    clearTimeout(cycleWakeTimer);
+    clearTimeout(engineRecoveryTimer);
     try { StockfishWasmEngine.terminate(); } catch (e) {}
     if (mainIntervalId) { clearInterval(mainIntervalId); mainIntervalId = null; }
     if (neuralCanvasRafId) { cancelAnimationFrame(neuralCanvasRafId); neuralCanvasRafId = null; }
@@ -343,6 +358,7 @@
 
   contentInstanceHandle = Object.freeze({
     isAlive: () => !extensionInvalidated && isContextValid(),
+    revive: () => mobileSession?.revive(),
     shutdown: () => shutdownOrphanedScript()
   });
   Object.defineProperty(window, CONTENT_INSTANCE_KEY, { value: contentInstanceHandle, configurable: true });
@@ -396,8 +412,15 @@
     return getShadow().getElementById(id);
   }
 
-  function saveSetting(obj) {
+  function saveSetting(obj, recalculate = false) {
     if (extensionInvalidated || !isContextValid()) return;
+    const preferences = window.__CC_MOBILE_PREFERENCES__;
+    if (preferences) {
+      const write = preferences.update("chesscom", obj, { source: "core", recalculate });
+      write.catch(error => handleAsyncStorageError("mobile preferences", error));
+      return write;
+    }
+    if (window.__CC_ANDROID_RUNTIME__) return;
     try {
       if (chrome.storage && chrome.storage.local) {
         const scoped = Object.fromEntries(Object.entries(obj || {}).map(([key, value]) => [storageKey(key), value]));
@@ -507,6 +530,12 @@
   }
 
   function applyWorkModePreset(mode, triggerSave = true) {
+    if (window.__CC_MOBILE_PREFERENCES__) {
+      if (!["all", "hvh", "legit"].includes(mode)) return;
+      if (triggerSave) saveSetting({ workMode: mode });
+      else { workMode = mode; updateUIValues(); }
+      return;
+    }
     if (mode === "hvh") {
       mode = "legit";
       setAutoStatusText("🛡️ На Chess.com режим Резни (HvH) отключен для 100% защиты от бана!", "#ffbe0b");
@@ -698,11 +727,31 @@
     neuralCanvasRafId = requestAnimationFrame(renderFrame);
   }
 
-  function loadSettings() {
+  function loadSettings(resolvedSettings = null, triggerRecalculate = true) {
     if (!isContextValid()) return;
+    const preferences = window.__CC_MOBILE_PREFERENCES__;
+    if (preferences && resolvedSettings === null) {
+      const generation = ++mobilePreferenceLoad;
+      mobilePreferenceUnsubscribe?.();
+      mobilePreferenceUnsubscribe = null;
+      return preferences.ready.then(() => {
+        if (extensionInvalidated || generation !== mobilePreferenceLoad) return;
+        loadSettings(preferences.get("chesscom"));
+        mobilePreferenceUnsubscribe = preferences.subscribe("chesscom", (settings, meta) => {
+          if (!extensionInvalidated) loadSettings(settings, meta.recalculate === true);
+        });
+      }).catch(error => {
+        handleAsyncStorageError("mobile preferences restore", error);
+        throw error;
+      });
+    }
+    if (window.__CC_ANDROID_RUNTIME__ && !preferences) return;
     try {
       if (chrome.storage && chrome.storage.local) {
-        chrome.storage.local.get(
+        const readSettings = preferences
+          ? (_keys, callback) => callback(Object.fromEntries(Object.entries(resolvedSettings).map(([key, value]) => [storageKey(key), value])))
+          : (keys, callback) => chrome.storage.local.get(keys, callback);
+        readSettings(
           [...SETTINGS_KEYS, ...SETTINGS_KEYS.map(storageKey)],
           (res) => {
             const storageFailed = handleAsyncStorageError("chrome.storage.local.get");
@@ -721,7 +770,7 @@
               }
             }
             if (Object.keys(migratedSettings).length > 0) saveSetting(migratedSettings);
-            workMode = res.workMode === "all" ? "all" : "legit";
+            workMode = preferences && ["all", "hvh", "legit"].includes(res.workMode) ? res.workMode : res.workMode === "all" ? "all" : "legit";
             if (res.activeTabId) activeTabId = res.activeTabId;
             if (typeof res.panelLeft === "number") panelLeft = res.panelLeft;
             if (typeof res.panelTop === "number") panelTop = res.panelTop;
@@ -777,7 +826,7 @@
             if (res.autoClickMethod === "bezier_click" || res.autoClickMethod === "bezier_drag") {
               autoClickMethod = res.autoClickMethod;
             }
-            if (engineMaxMode) {
+            if (!preferences && engineMaxMode) {
               useStockfishWasm = true;
               currentElo = 3000;
               currentStyle = "balanced";
@@ -797,7 +846,7 @@
             applyPersistentPanelGeometry();
             switchTab(activeTabId, false);
             updateUIValues();
-            forceRecalculate();
+            if (triggerRecalculate) forceRecalculate();
           }
         );
       }
@@ -1029,6 +1078,52 @@
     });
   }
 
+  function getMobileAnalysisConfig() {
+    const effective = mobileSession?.effective();
+    return JSON.stringify([currentElo, currentStyle, useStockfishWasm, engineMaxMode, turnMode, forcedMyColor,
+      showAverageMove, showWorstMove, useAverageMoveSometimes, autoT1LimiterEnabled, trapRadarEnabled, workMode,
+      Boolean(effective?.lowTier)]);
+  }
+
+  function finishCurrentAnalysis(requestId, phase = "complete") {
+    if (requestId !== analysisRequestId) return;
+    activeEngineBoardKey = "";
+    if (mobileAnalysisLease) mobileSession?.finishAnalysis(mobileAnalysisLease, phase);
+  }
+
+  function scheduleEngineRecovery(state) {
+    if (!mobileSession || engineRecoveryTimer || document.hidden || !useStockfishWasm) return;
+    const configKey = getMobileAnalysisConfig();
+    engineRecoveryTimer = setTimeout(async () => {
+      engineRecoveryTimer = null;
+      if (extensionInvalidated || document.hidden || currentPositionKey !== state.positionKey || getMobileAnalysisConfig() !== configKey) return;
+      const ready = await StockfishWasmEngine.initWorker();
+      if (extensionInvalidated || document.hidden || currentPositionKey !== state.positionKey || getMobileAnalysisConfig() !== configKey) return;
+      if (!ready) { scheduleEngineRecovery(state); return; }
+      mobileSession.retryAnalysis();
+      analysisRetryCount = finalEngineRetryCount = 0;
+      committedBoardKey = "";
+      runCycle(false);
+    }, 20000);
+  }
+
+  function suspendMobileCore(reason, releaseSearch) {
+    resetTurnDecision();
+    cancelNativeMove(reason);
+    clearTimeout(cycleWakeTimer);
+    clearTimeout(mobilePollTimer);
+    clearTimeout(engineRecoveryTimer);
+    engineRecoveryTimer = null;
+    cycleWakeTimer = mobilePollTimer = null;
+    if (releaseSearch) {
+      clearAnalysisRetry();
+      committedBoardKey = committedEnemyBoardKey = "";
+      StockfishWasmEngine.terminate();
+    }
+    if (reason !== "settings") hideArrows();
+    try { window.ChessFX?.stopPhonkEdit?.(shadowRoot); } catch (e) {}
+  }
+
   let lastStatusString = "";
   function setAutoStatusText(text, color = "#00f5d4") {
     if (text === lastStatusString) return;
@@ -1050,14 +1145,30 @@
   function cancelNativeMove(reason) {
     if (!activeNativeMove) return;
     const action = activeNativeMove;
+    action.cancelReason = reason;
+    if (action.gestureSent) {
+      nativeMoveBlockedKey = action.failureKey;
+      nativeMoveBlockedState = action.inputState;
+    }
     action.controller.abort();
-    if (action.failureKey === nativeMoveFailureKey && action.attempt === nativeMoveFailures) nativeMoveFailures = Math.max(0, nativeMoveFailures - 1);
-    try { window.__CC_ANDROID_RUNTIME__?.nativeRequest("input.cancel", {}).catch(() => {}); } catch (e) {}
-    activeNativeMove = null;
-    setMoveExecutionState(false, reason);
+  }
+
+  function isNativeAutoBlocked(state) {
+    const blocked = nativeMoveBlockedState;
+    if (!blocked) return false;
+    const changedGame = blocked.url !== location.href || blocked.board !== state.boardElement || blocked.myColor !== state.myColor;
+    const realReply = blocked.lastEnemy !== lastRealEnemyMove || (blocked.sawOpponent && state.actualTurn === state.myColor && state.positionKey !== blocked.positionKey);
+    if (changedGame || realReply) {
+      nativeMoveBlockedState = null;
+      nativeMoveBlockedKey = "";
+      return false;
+    }
+    if (state.actualTurn !== state.myColor) blocked.sawOpponent = true;
+    return true;
   }
 
   function handleMobileMoveLifecycle(event) {
+    if (mobileSession) return;
     const detail = event?.detail;
     if (detail?.cancelPendingMoves === true || detail?.state === "settings") {
       resetTurnDecision();
@@ -1085,6 +1196,7 @@
           positionId !== retry.positionId || currentPositionKey !== retry.positionKey) return;
       // Unlock immediately before the retry, never while the polling interval is still active.
       committedBoardKey = "";
+      mobileSession?.retryAnalysis();
       runCycle(false);
     }, delayMs);
   }
@@ -1135,6 +1247,7 @@
     hideArrows();
     // Piece styling alone must not cancel or restart canonical-position analysis.
     if (reason !== "BOARD_REPLACED" && reason !== "NO_BOARD") return;
+    mobileSession?.invalidate(reason);
     clearAnalysisRetry();
     positionAnalysisId++;
     analysisRequestId++;
@@ -1180,16 +1293,19 @@
       positionKey: state.positionKey,
       analysisKey: state.boardKey,
       elo: currentElo,
-      engineMaxMode
+      engineMaxMode,
+      ...(mobileSession ? { mobileEpoch: mobileSession.epoch, configKey: getMobileAnalysisConfig() } : {})
     };
   }
 
   function isCurrentAnalysisMeta(meta) {
+    if (mobileSession && (!mobileSession.isReady || meta?.mobileEpoch !== mobileSession.epoch)) return false;
     if (boardDirty && meta?.sessionId === analysisSessionId && meta.positionId === positionId && meta.analysisId === positionAnalysisId) {
       const fresh = captureBoardState(true);
       if (!fresh || fresh.animating) {
         committedBoardKey = "";
         activeEngineBoardKey = "";
+        mobileSession?.retryAnalysis();
         return false;
       }
       adoptPositionState(fresh);
@@ -1204,6 +1320,11 @@
   }
 
   function forceRecalculate() {
+    if (mobileSession?.hasAnalysis(currentPositionKey, getMobileAnalysisConfig()) && mobileSession.snapshot().analysis !== "failed") {
+      scheduleAutoMoveIfNeeded();
+      return;
+    }
+    if (mobileSession?.snapshot().analysis === "failed") mobileSession.retryAnalysis();
     cancelNativeMove("recalculate");
     clearAnalysisRetry();
     committedBoardKey = "";
@@ -2335,6 +2456,14 @@
     });
 
     const toggleAutoMoveMaster = (newState) => {
+      if (window.__CC_MOBILE_PREFERENCES__) {
+        if (newState) { nativeMoveFailureKey = ""; nativeMoveFailures = 0; }
+        else cancelNativeMove("automation-disabled");
+        resetTurnDecision();
+        saveSetting({ autoMoveEnabled: newState }, newState);
+        setAutoStatusText(newState ? "Автоход включён" : "Автоход выключен", newState ? "#38b000" : "#94a3b8");
+        return;
+      }
       autoMoveEnabled = newState;
       if (newState) { nativeMoveFailureKey = ""; nativeMoveFailures = 0; }
       if (!newState) cancelNativeMove("automation-disabled");
@@ -2417,6 +2546,11 @@
     });
 
     $("cc-sf-wasm-chk").addEventListener("change", (e) => {
+      if (window.__CC_MOBILE_PREFERENCES__) {
+        if (e.target.checked) StockfishWasmEngine.initWorker(); else StockfishWasmEngine.terminate();
+        saveSetting({ useStockfishWasm: e.target.checked }, true);
+        return;
+      }
       useStockfishWasm = e.target.checked;
       if (useStockfishWasm) StockfishWasmEngine.initWorker();
       else StockfishWasmEngine.terminate();
@@ -2425,6 +2559,11 @@
       forceRecalculate();
     });
     $("cc-engine-max-chk").addEventListener("change", (e) => {
+      if (window.__CC_MOBILE_PREFERENCES__) {
+        saveSetting({ engineMaxMode: e.target.checked }, true);
+        setAutoStatusText(e.target.checked ? "ENGINE MAX включён" : "ENGINE MAX выключен", "#64cdb9");
+        return;
+      }
       engineMaxMode = e.target.checked;
       if (engineMaxMode) {
         currentElo = 3000;
@@ -3294,6 +3433,7 @@
 
   function scheduleAutoMoveIfNeeded() {
     if (!autoMoveEnabled || extensionInvalidated || document.hidden) return;
+    if (mobileSession && !mobileSession.effective().autoMoveEnabled) return;
     if (window.__CC_ANDROID_SETTINGS_OPEN__ === true) {
       setAutoStatusText("Автоход на паузе: открыты настройки", "#ffbe0b");
       return;
@@ -3647,14 +3787,18 @@
   async function executeAndroidMoveOnBoard(moveObj, state, manualClick, promoPiece) {
     if (isExecutingMove || document.hidden || extensionInvalidated || (!manualClick && window.__CC_ANDROID_SETTINGS_OPEN__ === true)) return;
     const runtime = window.__CC_ANDROID_RUNTIME__;
+    if (!mobileSession?.isReady) { setAutoStatusText("Input snapshot is not ready", "#ffbe0b"); return; }
     const failureKey = `${location.href}|${state.positionId}|${state.positionKey}`;
+    if (!manualClick && (isNativeAutoBlocked(state) || nativeMoveBlockedKey === failureKey)) return;
     if (nativeMoveFailureKey !== failureKey) { nativeMoveFailureKey = failureKey; nativeMoveFailures = 0; }
     if (!manualClick && nativeMoveFailures >= 3) {
       setAutoStatusText("Нативный ввод не подтверждён после 3 попыток. Сходите вручную.", "#ffbe0b");
       return;
     }
     const attempt = ++nativeMoveFailures;
-    const action = { controller: new AbortController(), failureKey, attempt };
+    const action = { controller: new AbortController(), failureKey, attempt,
+      inputState: { url: location.href, board: state.boardElement, positionKey: state.positionKey,
+        myColor: state.myColor, lastEnemy: lastRealEnemyMove, sawOpponent: false } };
     activeNativeMove = action;
     const pageUrl = location.href;
     const previousMove = lastOurExecutedMove;
@@ -3676,7 +3820,7 @@
     });
     const requireVisibleContext = () => {
       if (activeNativeMove !== action || action.controller.signal.aborted || extensionInvalidated || document.hidden ||
-          location.href !== pageUrl || !boardEl?.isConnected || runtime.disposed || (!manualClick && !autoMoveEnabled)) throw new Error("Контекст хода изменился");
+           location.href !== pageUrl || !boardEl?.isConnected || runtime.disposed || (!manualClick && !mobileSession.effective().autoMoveEnabled)) throw new Error("Контекст хода изменился");
       if (!manualClick && window.__CC_ANDROID_SETTINGS_OPEN__ === true) throw new Error("Автоход на паузе: открыты настройки");
       if (findChessComBoardElement() !== boardEl) throw new Error("Доска была заменена");
       const guardReason = !manualClick && safeAntiBanGuard ? getAutoMoveGuardReason() : "";
@@ -3703,22 +3847,13 @@
     };
     const sendGesture = async (actionType, points, target = boardEl) => {
       requireVisibleContext();
-      for (const point of points) {
-        let hit = document.elementFromPoint(point.x, point.y);
-        const visited = new Set();
-        while (hit?.shadowRoot?.elementFromPoint && !visited.has(hit)) {
-          visited.add(hit);
-          const inner = hit.shadowRoot.elementFromPoint(point.x, point.y);
-          if (!inner || inner === hit) break;
-          hit = inner;
-        }
-        let inside = false;
-        for (let node = hit; node; node = node.parentElement || node.getRootNode?.()?.host) {
-          if (node === target) { inside = true; break; }
-        }
-        if (!inside) throw new Error("Доска перекрыта меню или другим элементом");
-      }
-      const result = await runtime.nativeRequest("input.gesture", { action: actionType, points, durationMs: actionType === "tap" ? 80 : 180 });
+      const targetId = mobileSession.registerTarget(target);
+      const snapshot = runtime.captureInputSnapshot({ points, targetId });
+      if (!snapshot || !snapshot.hit || snapshot.animating) throw new Error("Input target is obscured or moving");
+      action.gestureSent = true;
+      const result = await runtime.nativeRequest("input.gesture", {
+        action: actionType, points, durationMs: actionType === "tap" ? 80 : 180, targetId, snapshot
+      }, { signal: action.controller.signal });
       if (result?.ok !== true || result?.dispatched !== true) throw new Error("Android не подтвердил отправку касания");
     };
     const moveConfirmed = fresh => Boolean(fresh && fresh.boardElement === boardEl && fresh.boardKey !== state.boardKey &&
@@ -3779,6 +3914,11 @@
       setAutoStatusText(`Ход подтверждён: ${moveObj.from} -> ${moveObj.to}`, "#38b000");
     } catch (error) {
       if (activeNativeMove === action) {
+        if (action.gestureSent) {
+          nativeMoveBlockedKey = failureKey;
+          nativeMoveBlockedState = action.inputState;
+        }
+        mobileSession.reportError(error);
         lastOurExecutedMove = previousMove;
         setAutoStatusText(`Нативный ввод: ${error.message || "ошибка"}${error.code ? ` [${error.code}]` : ""}`, "#ffbe0b");
       }
@@ -3787,8 +3927,9 @@
       action.controller.abort();
       if (activeNativeMove === action) {
         activeNativeMove = null;
+        if (completed) { nativeMoveBlockedKey = ""; nativeMoveBlockedState = null; }
         moveCooldownUntil = Date.now() + (completed ? 180 : 350);
-        setMoveExecutionState(false, completed ? "confirmed" : "failed");
+        setMoveExecutionState(false, completed ? "confirmed" : action.cancelReason || "failed");
         triggerDebouncedCycle();
       }
     }
@@ -4544,6 +4685,7 @@
   }
 
   function renderArrowsOverlay(state, res) {
+    mobileSession?.applyVisualPolicy(getShadow());
     const tokenMismatch = currentPositionKey && (boardDirty || (res.positionId !== undefined && res.positionId !== positionId) || state?.positionKey !== currentPositionKey);
     if (!state || !res || tokenMismatch) {
       hideArrows();
@@ -5316,7 +5458,7 @@
       recordEvalPoint(state.boardKey, res.best.whitePerspectiveEval ?? res.best.evalPawns, res.opponentEvalDropPawns);
     }
 
-    if (audioRadarEnabled && window.ChessFX && state.actualTurn === state.myColor) {
+    if (audioRadarEnabled && (!mobileSession || mobileSession.effective().audioRadarEnabled) && window.ChessFX && state.actualTurn === state.myColor) {
       const dropVal = parseFloat(res.opponentEvalDropPawns) || 0;
       if (res.best && (res.best.isMateInOne || res.best.isForcedMateInTwo || res.best.isCheckmate)) {
         window.ChessFX.playTacticalAudioPing("mate_lock", state.boardKey);
@@ -5401,7 +5543,7 @@
         $("cc-best-title").innerHTML = `✦ ЛУЧШИЙ ХОД (1-Я ЛИНИЯ) • ${styleLabel}${badgesHtml}`;
       }
 
-      if ((isDeepPass || res.best.isMateInOne) && isBrilliant && phonkEditEnabled && state.actualTurn === state.myColor && window.ChessFX) {
+      if ((isDeepPass || res.best.isMateInOne) && isBrilliant && phonkEditEnabled && (!mobileSession || mobileSession.effective().mobileVisualEffects) && state.actualTurn === state.myColor && window.ChessFX) {
         window.ChessFX.triggerBrilliantPhonkEdit(getShadow(), res.best, state, 15000, false);
       }
 
@@ -5508,7 +5650,8 @@
       shutdownOrphanedScript();
       return;
     }
-    if (document.hidden) return;
+    if (document.hidden || (mobileSession && !mobileSession.isReady)) return;
+    if (mobileSession && window.__CC_ANDROID_SETTINGS_OPEN__ === true && !showArrows && !showEvalBar) return;
     if (forceByButton) clearAnalysisRetry();
 
     ensurePanel();
@@ -5530,6 +5673,12 @@
     }
     if (state.animating) return;
     adoptPositionState(state);
+    const mobileConfigKey = mobileSession ? getMobileAnalysisConfig() : "";
+    mobileSession?.observe(state, mobileConfigKey);
+    if (mobileSession && isNativeAutoBlocked(state) && state.actualTurn === state.myColor && !forceByButton) {
+      StockfishWasmEngine.terminate();
+      return;
+    }
     if (pendingAnalysisRetry && (pendingAnalysisRetry.url !== location.href || pendingAnalysisRetry.positionKey !== state.positionKey)) clearAnalysisRetry();
     if (!forceByButton && (isExecutingMove || Date.now() < moveCooldownUntil)) return;
     if (!forceByButton && pendingAnalysisRetry &&
@@ -5559,11 +5708,12 @@
         setAutoStatusText("Ждем ответа соперника на Chess.com...", "#94a3b8");
       }
       committedBoardKey = "";
+      if (mobileSession) StockfishWasmEngine.terminate();
 
       if (committedEnemyBoardKey !== state.boardKey) {
         committedEnemyBoardKey = state.boardKey;
         hideArrows();
-        if (isAltPressed || heatmapAlwaysOn) {
+        if (isAltPressed || (heatmapAlwaysOn && (!mobileSession || mobileSession.effective().heatmapAlwaysOn))) {
           safeSendMessage({ type: "GET_BOARD_HEATMAP", fen: state.fen, myColor: state.myColor }, (hmRes) => {
             if (hmRes && Array.isArray(hmRes.heatmap)) {
               const fresh = captureBoardState(true);
@@ -5583,6 +5733,11 @@
 
     if (standbyBox) standbyBox.style.display = "none";
     if (activeBox) activeBox.style.display = "flex";
+    if (mobileSession && !mobileSession.canAnalyze(state, forceByButton)) return;
+    if (mobileSession?.hasAnalysis(state.positionKey, mobileConfigKey)) {
+      if (cachedMoves.best && isCachedAnalysisCurrent(state)) scheduleAutoMoveIfNeeded();
+      return;
+    }
 
     if (!forceByButton && state.boardKey === committedBoardKey) {
       if (
@@ -5599,6 +5754,9 @@
       return;
     }
 
+    const lease = mobileSession?.beginAnalysis(state, mobileConfigKey);
+    if (mobileSession && !lease) return;
+    mobileAnalysisLease = lease || null;
     committedBoardKey = state.boardKey;
     committedEnemyBoardKey = "";
     resetTurnDecision();
@@ -5639,11 +5797,11 @@
         historyTrusted: historyTrustedForState,
         meta: fastMeta
       },
-      (fastRes) => {
+      async (fastRes) => {
         const responseMeta = fastRes?.meta || fastMeta;
         if (myReqId !== analysisRequestId || !isCurrentAnalysisMeta(responseMeta)) return;
         if (!fastRes || !fastRes.best || fastRes.error) {
-          activeEngineBoardKey = "";
+          finishCurrentAnalysis(myReqId, "failed");
           clearPositionPresentation(fastRes?.error ? "ОШИБКА АНАЛИЗА • ПОВТОР..." : "МАТ / ПАТ • НЕТ ХОДОВ");
           committedBoardKey = state.boardKey;
           boardDirty = false;
@@ -5662,7 +5820,7 @@
 
         if (fastCanFinalize) {
           if (deepBadge) deepBadge.style.display = "none";
-          if (myReqId === analysisRequestId) activeEngineBoardKey = "";
+          finishCurrentAnalysis(myReqId);
           return;
         }
 
@@ -5679,6 +5837,12 @@
         const wasmPromise = shouldRunWasm
           ? StockfishWasmEngine.analyze(state.fen, wasmMovetime, needAvg ? 3 : 1, uciHistoryList, historyTrustedForState, { ...deepMeta, engineMaxMode, isDangerPosition: Boolean(fastRes.isDangerPosition || fastRes.hangingSquare), needAverage: needAvg })
           : Promise.resolve(null);
+        if (shouldRunWasm && window.__CC_ANDROID_RUNTIME__) {
+          const dispatch = await StockfishWasmEngine.whenDispatched();
+          if (myReqId !== analysisRequestId || !isCurrentAnalysisMeta(deepMeta)) return;
+          deepMeta.ownedEngineRequestId = dispatch?.requestId || "";
+          deepMeta.annotationOnly = true;
+        }
 
         safeSendMessage(
           {
@@ -5721,13 +5885,13 @@
             const requiresFinalEngine = usesStrictBestMovePolicy() || Boolean(finalDeep?.analysisIncomplete);
             if (!backgroundDeepOk && !wasmApplied && !requiresFinalEngine) {
               if (deepBadge) deepBadge.style.display = "none";
-              if (myReqId === analysisRequestId) activeEngineBoardKey = "";
+              finishCurrentAnalysis(myReqId);
               return;
             }
 
             const hasFinalEngine = Boolean(finalDeep?.engineMeta || finalDeep?.syzygyActive || finalDeep?.best?.fromSyzygy);
             if (requiresFinalEngine && !hasFinalEngine) {
-              if (myReqId === analysisRequestId) activeEngineBoardKey = "";
+              finishCurrentAnalysis(myReqId, "failed");
               if (!useStockfishWasm) {
                 if (deepBadge) deepBadge.style.display = "none";
                 committedBoardKey = state.boardKey;
@@ -5746,6 +5910,7 @@
                 if (deepBadge) deepBadge.style.display = "none";
                 committedBoardKey = state.boardKey;
                 setAutoStatusText("STOCKFISH недоступен • автоход заблокирован", "#ff2a85");
+                scheduleEngineRecovery(state);
               }
               return;
             }
@@ -5757,7 +5922,7 @@
             finalDeep.analysisFinalized = true;
             finalDeep.analysisSource = finalDeep.best?.fromSyzygy ? "syzygy" : (wasmApplied ? "stockfish" : "deep");
             applyAnalysisResult(state, finalDeep, true, firstBestUci);
-            if (myReqId === analysisRequestId) activeEngineBoardKey = "";
+            finishCurrentAnalysis(myReqId);
           }
         );
       }
@@ -5766,7 +5931,14 @@
 
   let rafPending = false;
   function triggerDebouncedCycle() {
-    if (extensionInvalidated || rafPending || isExecutingMove || Date.now() < moveCooldownUntil) return;
+    if (extensionInvalidated || document.hidden || (mobileSession && !mobileSession.isReady) || rafPending || isExecutingMove) return;
+    if (Date.now() < moveCooldownUntil) {
+      if (mobileSession && !cycleWakeTimer) cycleWakeTimer = setTimeout(() => {
+        cycleWakeTimer = null;
+        triggerDebouncedCycle();
+      }, Math.max(16, moveCooldownUntil - Date.now()));
+      return;
+    }
     rafPending = true;
     requestAnimationFrame(() => {
       rafPending = false;
@@ -5776,6 +5948,7 @@
 
   let observedBoardNode = null;
   let observedBoardRoots = [];
+  let boardObserversAttached = false;
   const domObserver = new MutationObserver((mutations) => {
     const boardStructureChanged = mutations.some(mutation =>
       mutation.type === "childList" &&
@@ -5783,7 +5956,7 @@
         node?.matches?.(CHESSCOM_BOARD_SELECTOR) || node?.querySelector?.(CHESSCOM_BOARD_SELECTOR)
       )
     );
-    if (mutations.some(mutation => mutation.type === "childList")) cachedChessComRoots = [];
+    if (boardStructureChanged) cachedChessComRoots = [];
     if (boardStructureChanged) cachedChessComBoardElement = null;
     const touchesPiece = mutations.some(mutation => {
       const target = mutation.target;
@@ -5792,8 +5965,10 @@
         node?.matches?.(".piece, piece") || node?.querySelector?.(".piece, piece")
       );
     });
-    if (touchesPiece) markBoardDirty("MOVE");
-    syncVisualPosition();
+    const touchesTurn = mutations.some(mutation => mutation.target?.matches?.("wc-chess-board, chess-board, .clock-player-turn, .clock-running, .clock-bottom, .clock-top"));
+    if (mobileSession && !touchesPiece && !boardStructureChanged && !touchesTurn) return;
+    if (touchesPiece || touchesTurn || boardStructureChanged) markBoardDirty("MOVE");
+    if (!mobileSession) syncVisualPosition();
     triggerDebouncedCycle();
   });
   const boardResizeObserver = typeof ResizeObserver === "function" ? new ResizeObserver(() => syncVisualPosition()) : null;
@@ -5802,7 +5977,7 @@
     if (extensionInvalidated || !isContextValid()) return;
     const boardEl = findChessComBoardElement();
     const roots = boardEl ? getChessComBoardRoots(boardEl) : [];
-    if (boardEl !== observedBoardNode || roots.length !== observedBoardRoots.length || roots.some((root, i) => root !== observedBoardRoots[i])) {
+    if (!boardObserversAttached || boardEl !== observedBoardNode || roots.length !== observedBoardRoots.length || roots.some((root, i) => root !== observedBoardRoots[i])) {
       domObserver.disconnect();
       if (boardResizeObserver) boardResizeObserver.disconnect();
       if (boardEl !== observedBoardNode) {
@@ -5810,17 +5985,18 @@
       }
       observedBoardNode = boardEl;
       observedBoardRoots = roots;
+      boardObserversAttached = true;
       domObserver.observe(document.documentElement, { childList: true, subtree: true });
       for (const root of roots) {
         domObserver.observe(root, {
           childList: true,
           subtree: true,
           attributes: true,
-          attributeFilter: ["class", "style", "orientation"]
+          attributeFilter: ["class", "style", "orientation", "turn", "data-turn", "side-to-move"]
         });
       }
       if (boardEl && boardResizeObserver) boardResizeObserver.observe(boardEl);
-      syncVisualPosition();
+      if (!mobileSession) syncVisualPosition();
       triggerDebouncedCycle();
     }
   }
@@ -5847,11 +6023,53 @@
   };
 
   try { chrome.storage?.onChanged?.addListener(handleStorageChanges); } catch (e) {}
-  loadSettings();
-  ensureObserversAttached();
+  function scheduleMobilePoll() {
+    clearTimeout(mobilePollTimer);
+    if (extensionInvalidated || document.hidden || !mobileSession?.isReady) return;
+    mobilePollTimer = setTimeout(() => {
+      mobilePollTimer = null;
+      if (extensionInvalidated || document.hidden) return;
+      ensureObserversAttached();
+      if (!isExecutingMove && Date.now() >= moveCooldownUntil) runCycle(false);
+      scheduleMobilePoll();
+    }, 1600);
+  }
+
+  const settingsReady = loadSettings();
+  if (mobileSession) {
+    Promise.all([settingsReady, mobileSession.ready]).then(() => {
+      if (extensionInvalidated) return;
+      unregisterMobileCore = mobileSession.registerCore("chesscom", {
+        captureState: () => captureBoardState(true),
+        isAnimating: board => Boolean(queryChessComBoard(board, ".piece.dragging, .piece.animating").length),
+        viewState: () => ({ executing: isExecutingMove, bestUci: cachedMoves.best?.uci || null,
+          finalAnalysis: Boolean(cachedMoves.engineMeta || cachedMoves.syzygyActive), retryPending: Boolean(pendingAnalysisRetry), nativeInputBlocked: Boolean(nativeMoveBlockedState) }),
+        cancelSearch() {
+          analysisRequestId++;
+          positionAnalysisId++;
+          activeEngineBoardKey = "";
+          mobileAnalysisLease = null;
+          StockfishWasmEngine.cancel();
+          clearAnalysisRetry();
+        },
+        suspend: suspendMobileCore,
+        resume() {
+          boardDirty = true;
+          ensureObserversAttached();
+          triggerDebouncedCycle();
+          scheduleMobilePoll();
+        },
+        refreshVisuals() { mobileSession.applyVisualPolicy(shadowRoot); triggerDebouncedCycle(); }
+      });
+      mobileSession.applyVisualPolicy(shadowRoot);
+      ensureObserversAttached();
+      triggerDebouncedCycle();
+      scheduleMobilePoll();
+    }).catch(error => mobileSession.reportError(error));
+  } else ensureObserversAttached();
 
   let lastIdleBoardPollAt = 0;
-  mainIntervalId = setInterval(() => {
+  if (!mobileSession) mainIntervalId = setInterval(() => {
     if (extensionInvalidated || !isContextValid()) {
       shutdownOrphanedScript();
       return;
